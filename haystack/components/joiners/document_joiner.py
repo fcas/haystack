@@ -4,94 +4,160 @@
 
 import itertools
 from collections import defaultdict
+from dataclasses import replace
+from enum import Enum
 from math import inf
-from typing import List, Optional
+from typing import Any
 
-from haystack import Document, component, logging
+from haystack import Document, component, default_from_dict, default_to_dict, logging
 from haystack.core.component.types import Variadic
+from haystack.utils.misc import _reciprocal_rank_fusion
 
 logger = logging.getLogger(__name__)
+
+
+class JoinMode(Enum):
+    """
+    Enum for join mode.
+    """
+
+    CONCATENATE = "concatenate"
+    MERGE = "merge"
+    RECIPROCAL_RANK_FUSION = "reciprocal_rank_fusion"
+    DISTRIBUTION_BASED_RANK_FUSION = "distribution_based_rank_fusion"
+
+    def __str__(self) -> str:
+        return self.value
+
+    @staticmethod
+    def from_str(string: str) -> "JoinMode":
+        """
+        Convert a string to a JoinMode enum.
+        """
+        enum_map = {e.value: e for e in JoinMode}
+        mode = enum_map.get(string)
+        if mode is None:
+            msg = f"Unknown join mode '{string}'. Supported modes in DocumentJoiner are: {list(enum_map.keys())}"
+            raise ValueError(msg)
+        return mode
 
 
 @component
 class DocumentJoiner:
     """
-    A component that joins multiple list of Documents into a single list.
+    Joins multiple lists of documents into a single list.
 
-    It supports different joins modes:
-    - concatenate: Keeps the highest scored Document in case of duplicates.
-    - merge: Merge a calculate a weighted sum of the scores of duplicate Documents.
-    - reciprocal_rank_fusion: Merge and assign scores based on reciprocal rank fusion.
+    It supports different join modes:
+    - concatenate: Keeps the highest-scored document in case of duplicates.
+    - merge: Calculates a weighted sum of scores for duplicates and merges them.
+    - reciprocal_rank_fusion: Merges and assigns scores based on reciprocal rank fusion.
+    - distribution_based_rank_fusion: Merges and assigns scores based on scores distribution in each Retriever.
 
-    Usage example:
+    ### Usage example:
+
     ```python
+    from haystack import Pipeline, Document
+    from haystack.components.embedders import OpenAITextEmbedder, OpenAIDocumentEmbedder
+    from haystack.components.joiners import DocumentJoiner
+    from haystack.components.retrievers import InMemoryBM25Retriever
+    from haystack.components.retrievers import InMemoryEmbeddingRetriever
+    from haystack.document_stores.in_memory import InMemoryDocumentStore
+
     document_store = InMemoryDocumentStore()
+    docs = [Document(content="Paris"), Document(content="Berlin"), Document(content="London")]
+    embedder = OpenAIDocumentEmbedder()
+    docs_embeddings = embedder.run(docs)
+    document_store.write_documents(docs_embeddings['documents'])
+
     p = Pipeline()
     p.add_component(instance=InMemoryBM25Retriever(document_store=document_store), name="bm25_retriever")
     p.add_component(
-            instance=SentenceTransformersTextEmbedder(model="sentence-transformers/all-MiniLM-L6-v2"),
+            instance=OpenAITextEmbedder(),
             name="text_embedder",
         )
     p.add_component(instance=InMemoryEmbeddingRetriever(document_store=document_store), name="embedding_retriever")
     p.add_component(instance=DocumentJoiner(), name="joiner")
     p.connect("bm25_retriever", "joiner")
     p.connect("embedding_retriever", "joiner")
-    p.connect("text_embedder", "embedding_retriever")
+    p.connect("text_embedder.embedding", "embedding_retriever.query_embedding")
     query = "What is the capital of France?"
-    p.run(data={"query": query})
+    p.run(data={"query": query, "text": query, "top_k": 1})
     ```
     """
 
     def __init__(
         self,
-        join_mode: str = "concatenate",
-        weights: Optional[List[float]] = None,
-        top_k: Optional[int] = None,
+        join_mode: str | JoinMode = JoinMode.CONCATENATE,
+        weights: list[float] | None = None,
+        top_k: int | None = None,
         sort_by_score: bool = True,
-    ):
+    ) -> None:
         """
-        Create an DocumentJoiner component.
+        Creates a DocumentJoiner component.
 
         :param join_mode:
             Specifies the join mode to use. Available modes:
-            - `concatenate`
-            - `merge`
-            - `reciprocal_rank_fusion`
+            - `concatenate`: Keeps the highest-scored document in case of duplicates.
+            - `merge`: Calculates a weighted sum of scores for duplicates and merges them.
+            - `reciprocal_rank_fusion`: Merges and assigns scores based on reciprocal rank fusion.
+            - `distribution_based_rank_fusion`: Merges and assigns scores based on scores
+            distribution in each Retriever.
         :param weights:
-            Weight for each list of Documents received, must have the same length as the number of inputs.
-            If `join_mode` is `concatenate` this parameter is ignored.
+            Assign importance to each list of documents to influence how they're joined.
+            This parameter is ignored for
+            `concatenate` or `distribution_based_rank_fusion` join modes.
+            Weight for each list of documents must match the number of inputs.
         :param top_k:
-            The maximum number of Documents to return.
+            The maximum number of documents to return. Must be `None` or greater than 0.
         :param sort_by_score:
-            If True sorts the Documents by score in descending order.
-            If a Document has no score, it is handled as if its score is -infinity.
+            If `True`, sorts the documents by score in descending order.
+            If a document has no score, it is handled as if its score is -infinity.
+
+        :raises ValueError:
+            If `top_k` is not `None` and is less than or equal to 0.
         """
-        if join_mode not in ["concatenate", "merge", "reciprocal_rank_fusion"]:
-            raise ValueError(f"DocumentJoiner component does not support '{join_mode}' join_mode.")
+        if top_k is not None and top_k <= 0:
+            raise ValueError("top_k must be greater than 0.")
+        if isinstance(join_mode, str):
+            join_mode = JoinMode.from_str(join_mode)
+        join_mode_functions = {
+            JoinMode.CONCATENATE: DocumentJoiner._concatenate,
+            JoinMode.MERGE: self._merge,
+            JoinMode.RECIPROCAL_RANK_FUSION: self._rrf,
+            JoinMode.DISTRIBUTION_BASED_RANK_FUSION: DocumentJoiner._distribution_based_rank_fusion,
+        }
+        self.join_mode_function = join_mode_functions[join_mode]
         self.join_mode = join_mode
-        self.weights = [float(i) / sum(weights) for i in weights] if weights else None
+        if weights:
+            weight_sum = sum(weights)
+            if weight_sum == 0:
+                raise ValueError("The provided `weights` must not sum to zero.")
+            self.weights: list[float] | None = [float(i) / weight_sum for i in weights]
+        else:
+            self.weights = None
         self.top_k = top_k
         self.sort_by_score = sort_by_score
 
-    @component.output_types(documents=List[Document])
-    def run(self, documents: Variadic[List[Document]]):
+    @component.output_types(documents=list[Document])
+    def run(self, documents: Variadic[list[Document]], top_k: int | None = None) -> dict[str, Any]:
         """
         Joins multiple lists of Documents into a single list depending on the `join_mode` parameter.
 
         :param documents:
-            List of list of Documents to be merged.
+            List of list of documents to be merged.
+        :param top_k:
+            The maximum number of documents to return. Overrides the instance's `top_k` if provided.
+            A value of 0 returns no documents. Must not be negative.
 
         :returns:
             A dictionary with the following keys:
             - `documents`: Merged list of Documents
+
+        :raises ValueError:
+            If `top_k` is negative.
         """
-        output_documents = []
-        if self.join_mode == "concatenate":
-            output_documents = self._concatenate(documents)
-        elif self.join_mode == "merge":
-            output_documents = self._merge(documents)
-        elif self.join_mode == "reciprocal_rank_fusion":
-            output_documents = self._reciprocal_rank_fusion(documents)
+        documents = list(documents)
+        output_documents = self.join_mode_function(documents)
 
         if self.sort_by_score:
             output_documents = sorted(
@@ -103,66 +169,114 @@ class DocumentJoiner:
                     "score, so those with score=None were sorted as if they had a score of -infinity."
                 )
 
-        if self.top_k:
+        if top_k is not None:
+            if top_k < 0:
+                raise ValueError("top_k must not be negative.")
+            output_documents = output_documents[:top_k]
+        elif self.top_k is not None:
             output_documents = output_documents[: self.top_k]
+
         return {"documents": output_documents}
 
-    def _concatenate(self, document_lists):
+    @staticmethod
+    def _concatenate(document_lists: list[list[Document]]) -> list[Document]:
         """
-        Concatenate multiple lists of Documents and return only the Document with the highest score for duplicate Documents.
+        Concatenate multiple lists of Documents and return only the Document with the highest score for duplicates.
         """
         output = []
         docs_per_id = defaultdict(list)
         for doc in itertools.chain.from_iterable(document_lists):
             docs_per_id[doc.id].append(doc)
         for docs in docs_per_id.values():
-            doc_with_best_score = max(docs, key=lambda doc: doc.score if doc.score else -inf)
+            doc_with_best_score = max(docs, key=lambda doc: doc.score if doc.score is not None else -inf)
             output.append(doc_with_best_score)
         return output
 
-    def _merge(self, document_lists):
+    def _merge(self, document_lists: list[list[Document]]) -> list[Document]:
         """
         Merge multiple lists of Documents and calculate a weighted sum of the scores of duplicate Documents.
         """
-        scores_map = defaultdict(int)
+        # This check prevents a division by zero when no documents are passed
+        if not document_lists:
+            return []
+
+        scores_map: dict = defaultdict(int)
         documents_map = {}
         weights = self.weights if self.weights else [1 / len(document_lists)] * len(document_lists)
 
-        for documents, weight in zip(document_lists, weights):
+        for documents, weight in zip(document_lists, weights, strict=True):
             for doc in documents:
-                scores_map[doc.id] += (doc.score if doc.score else 0) * weight
+                scores_map[doc.id] += (doc.score if doc.score is not None else 0) * weight
                 documents_map[doc.id] = doc
 
-        for doc in documents_map.values():
-            doc.score = scores_map[doc.id]
+        return [replace(doc, score=scores_map[doc.id]) for doc in documents_map.values()]
 
-        return documents_map.values()
-
-    def _reciprocal_rank_fusion(self, document_lists):
+    def _rrf(self, document_lists: list[list[Document]]) -> list[Document]:
         """
         Merge multiple lists of Documents and assign scores based on reciprocal rank fusion.
-
-        The constant k is set to 61 (60 was suggested by the original paper,
-        plus 1 as python lists are 0-based and the paper used 1-based ranking).
         """
-        k = 61
+        return _reciprocal_rank_fusion(document_lists, weights=self.weights)
 
-        scores_map = defaultdict(int)
-        documents_map = {}
-        weights = self.weights if self.weights else [1 / len(document_lists)] * len(document_lists)
+    @staticmethod
+    def _distribution_based_rank_fusion(document_lists: list[list[Document]]) -> list[Document]:
+        """
+        Merge multiple lists of Documents and assign scores based on Distribution-Based Score Fusion.
 
-        # Calculate weighted reciprocal rank fusion score
-        for documents, weight in zip(document_lists, weights):
-            for rank, doc in enumerate(documents):
-                scores_map[doc.id] += (weight * len(document_lists)) / (k + rank)
-                documents_map[doc.id] = doc
+        (https://medium.com/plain-simple-software/distribution-based-score-fusion-dbsf-a-new-approach-to-vector-search-ranking-f87c37488b18)
+        If a Document is in more than one retriever, the one with the highest score is used.
+        """
+        rescaled_lists: list[list[Document]] = []
+        for documents in document_lists:
+            if len(documents) == 0:
+                rescaled_lists.append(documents)
+                continue
 
-        # Normalize scores. Note: len(results) / k is the maximum possible score,
-        # achieved by being ranked first in all doc lists with non-zero weight.
-        for _id in scores_map:
-            scores_map[_id] /= len(document_lists) / k
+            scores_list = [doc.score if doc.score is not None else 0 for doc in documents]
 
-        for doc in documents_map.values():
-            doc.score = scores_map[doc.id]
+            mean_score = sum(scores_list) / len(scores_list)
+            std_dev = (sum((x - mean_score) ** 2 for x in scores_list) / len(scores_list)) ** 0.5
+            min_score = mean_score - 3 * std_dev
+            max_score = mean_score + 3 * std_dev
+            delta_score = max_score - min_score
 
-        return documents_map.values()
+            # if all docs have the same score delta_score is 0, the docs are uninformative for the query
+            rescaled_lists.append(
+                [
+                    replace(
+                        doc,
+                        score=((doc.score if doc.score is not None else 0) - min_score) / delta_score
+                        if delta_score != 0.0
+                        else 0.0,
+                    )
+                    for doc in documents
+                ]
+            )
+
+        return DocumentJoiner._concatenate(document_lists=rescaled_lists)
+
+    def to_dict(self) -> dict[str, Any]:
+        """
+        Serializes the component to a dictionary.
+
+        :returns:
+            Dictionary with serialized data.
+        """
+        return default_to_dict(
+            self,
+            join_mode=str(self.join_mode),
+            weights=self.weights,
+            top_k=self.top_k,
+            sort_by_score=self.sort_by_score,
+        )
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DocumentJoiner":
+        """
+        Deserializes the component from a dictionary.
+
+        :param data:
+            The dictionary to deserialize from.
+        :returns:
+            The deserialized component.
+        """
+        return default_from_dict(cls, data)

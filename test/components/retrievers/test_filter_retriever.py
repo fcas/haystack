@@ -1,15 +1,17 @@
 # SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
 #
 # SPDX-License-Identifier: Apache-2.0
-from typing import Dict, Any, List
+
+from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
-from haystack import Pipeline, DeserializationError
-from haystack.testing.factory import document_store_class
+from haystack import Pipeline
 from haystack.components.retrievers.filter_retriever import FilterRetriever
 from haystack.dataclasses import Document
 from haystack.document_stores.in_memory import InMemoryDocumentStore
+from haystack.testing.factory import document_store_class
 
 
 @pytest.fixture()
@@ -36,18 +38,18 @@ def sample_document_store(sample_docs):
 
 class TestFilterRetriever:
     @classmethod
-    def _documents_equal(cls, docs1: List[Document], docs2: List[Document]) -> bool:
+    def _documents_equal(cls, docs1: list[Document], docs2: list[Document]) -> bool:
         # # Order doesn't matter; we sort before comparing
         docs1.sort(key=lambda x: x.id)
         docs2.sort(key=lambda x: x.id)
         return docs1 == docs2
 
-    def test_init_default(self):
-        retriever = FilterRetriever(InMemoryDocumentStore())
+    def test_init_default(self, in_memory_doc_store):
+        retriever = FilterRetriever(in_memory_doc_store)
         assert retriever.filters is None
 
-    def test_init_with_parameters(self):
-        retriever = FilterRetriever(InMemoryDocumentStore(), filters={"lang": "en"})
+    def test_init_with_parameters(self, in_memory_doc_store):
+        retriever = FilterRetriever(in_memory_doc_store, filters={"lang": "en"})
         assert retriever.filters == {"lang": "en"}
 
     def test_to_dict(self):
@@ -63,10 +65,13 @@ class TestFilterRetriever:
         }
 
     def test_to_dict_with_custom_init_parameters(self):
-        ds = InMemoryDocumentStore()
+        ds = InMemoryDocumentStore(index="test_to_dict_with_custom_init_parameters")
         serialized_ds = ds.to_dict()
 
-        component = FilterRetriever(document_store=InMemoryDocumentStore(), filters={"lang": "en"})
+        component = FilterRetriever(
+            document_store=InMemoryDocumentStore(index="test_to_dict_with_custom_init_parameters"),
+            filters={"lang": "en"},
+        )
         data = component.to_dict()
         assert data == {
             "type": "haystack.components.retrievers.filter_retriever.FilterRetriever",
@@ -89,8 +94,8 @@ class TestFilterRetriever:
         assert component.filters == {"lang": "en"}
 
     def test_from_dict_without_docstore(self):
-        data = {"type": "InMemoryBM25Retriever", "init_parameters": {}}
-        with pytest.raises(DeserializationError, match="Missing 'document_store' in serialization data"):
+        data = {"type": "haystack.components.retrievers.filter_retriever.FilterRetriever", "init_parameters": {}}
+        with pytest.raises(TypeError, match="missing 1 required positional argument: 'document_store'"):
             FilterRetriever.from_dict(data)
 
     def test_retriever_init_filter(self, sample_document_store, sample_docs):
@@ -123,7 +128,7 @@ class TestFilterRetriever:
 
         pipeline = Pipeline()
         pipeline.add_component("retriever", retriever)
-        result: Dict[str, Any] = pipeline.run(data={"retriever": {}})
+        result: dict[str, Any] = pipeline.run(data={"retriever": {}})
 
         assert result
         assert "retriever" in result
@@ -131,7 +136,7 @@ class TestFilterRetriever:
         assert results_docs
         assert TestFilterRetriever._documents_equal(results_docs, sample_docs["de_docs"])
 
-        result: Dict[str, Any] = pipeline.run(
+        result: dict[str, Any] = pipeline.run(
             data={"retriever": {"filters": {"field": "lang", "operator": "==", "value": "en"}}}
         )
 
@@ -140,3 +145,14 @@ class TestFilterRetriever:
         results_docs = result["retriever"]["documents"]
         assert results_docs
         assert TestFilterRetriever._documents_equal(results_docs, sample_docs["en_docs"])
+
+    def test_close(self):
+        closable_document_store = Mock(spec=["close"])
+        retriever = FilterRetriever(document_store=closable_document_store)
+        retriever.close()
+        closable_document_store.close.assert_called_once_with()
+
+        nonclosable_document_store = Mock(spec=[])
+        retriever = FilterRetriever(document_store=nonclosable_document_store)
+        retriever.close()
+        assert nonclosable_document_store.mock_calls == []

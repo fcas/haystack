@@ -3,12 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import datetime
+import functools
 import logging
 import os
 import uuid
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any
 
 import posthog
 import yaml
@@ -42,7 +44,7 @@ class Telemetry:
     Check out the documentation for more details: [Telemetry](https://docs.haystack.deepset.ai/docs/telemetry).
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """
         Initializes the telemetry.
 
@@ -61,12 +63,12 @@ class Telemetry:
             logging.getLogger(module_name).addHandler(logging.NullHandler())
             logging.getLogger(module_name).propagate = False
 
-        self.user_id = None
+        self.user_id = ""
 
         if CONFIG_PATH.exists():
             # Load the config file
             try:
-                with open(CONFIG_PATH, "r", encoding="utf-8") as config_file:
+                with open(CONFIG_PATH, encoding="utf-8") as config_file:
                     config = yaml.safe_load(config_file)
                     if "user_id" in config:
                         self.user_id = config["user_id"]
@@ -80,7 +82,8 @@ class Telemetry:
                 "Haystack sends anonymous usage data to understand the actual usage and steer dev efforts "
                 "towards features that are most meaningful to users. You can opt-out at anytime by manually "
                 "setting the environment variable HAYSTACK_TELEMETRY_ENABLED as described for different "
-                "operating systems in the [documentation page](https://docs.haystack.deepset.ai/docs/telemetry#how-can-i-opt-out). "
+                "operating systems in the "
+                "[documentation page](https://docs.haystack.deepset.ai/docs/telemetry#how-can-i-opt-out). "
                 "More information at [Telemetry](https://docs.haystack.deepset.ai/docs/telemetry)."
             )
             CONFIG_PATH.parents[0].mkdir(parents=True, exist_ok=True)
@@ -95,7 +98,7 @@ class Telemetry:
 
         self.event_properties = collect_system_specs()
 
-    def send_event(self, event_name: str, event_properties: Optional[Dict[str, Any]] = None):
+    def send_event(self, event_name: str, event_properties: dict[str, Any] | None = None) -> None:
         """
         Sends a telemetry event.
 
@@ -112,15 +115,15 @@ class Telemetry:
             logger.debug("Telemetry couldn't make a POST request to PostHog.", exc_info=e)
 
 
-def send_telemetry(func):
+def send_telemetry(func: Callable[..., Any]) -> Callable[..., None]:
     """
     Decorator that sends the output of the wrapped function to PostHog.
 
     The wrapped function is actually called only if telemetry is enabled.
     """
 
-    # FIXME? Somehow, functools.wraps makes `telemetry` out of scope. Let's take care of it later.
-    def send_telemetry_wrapper(*args, **kwargs):
+    @functools.wraps(func)
+    def send_telemetry_wrapper(*args: Any, **kwargs: Any) -> None:
         try:
             if telemetry:
                 output = func(*args, **kwargs)
@@ -134,7 +137,7 @@ def send_telemetry(func):
 
 
 @send_telemetry
-def pipeline_running(pipeline: "Pipeline") -> Optional[Tuple[str, Dict[str, Any]]]:
+def pipeline_running(pipeline: "Pipeline") -> tuple[str, dict[str, Any]] | None:
     """
     Collects telemetry data for a pipeline run and sends it to Posthog.
 
@@ -146,18 +149,18 @@ def pipeline_running(pipeline: "Pipeline") -> Optional[Tuple[str, Dict[str, Any]
     pipeline._telemetry_runs += 1
     if (
         pipeline._last_telemetry_sent
-        and (datetime.datetime.now() - pipeline._last_telemetry_sent).seconds < MIN_SECONDS_BETWEEN_EVENTS
+        and (datetime.datetime.now() - pipeline._last_telemetry_sent).total_seconds() < MIN_SECONDS_BETWEEN_EVENTS
     ):
         return None
 
     pipeline._last_telemetry_sent = datetime.datetime.now()
 
     # Collect info about components
-    components: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    components: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for component_name, instance in pipeline.walk():
         component_qualified_class_name = generate_qualified_class_name(type(instance))
         if hasattr(instance, "_get_telemetry_data"):
-            telemetry_data = getattr(instance, "_get_telemetry_data")()
+            telemetry_data = instance._get_telemetry_data()
             if not isinstance(telemetry_data, dict):
                 raise TypeError(
                     f"Telemetry data for component {component_name} must be a dictionary but is {type(telemetry_data)}."
@@ -167,15 +170,16 @@ def pipeline_running(pipeline: "Pipeline") -> Optional[Tuple[str, Dict[str, Any]
             components[component_qualified_class_name].append({"name": component_name})
 
     # Data sent to Posthog
-    return "Pipeline run (2.x)", {
+    return "Pipeline run (3.x)", {
         "pipeline_id": str(id(pipeline)),
+        "pipeline_type": generate_qualified_class_name(type(pipeline)),
         "runs": pipeline._telemetry_runs,
         "components": components,
     }
 
 
 @send_telemetry
-def tutorial_running(tutorial_id: str) -> Tuple[str, Dict[str, Any]]:
+def tutorial_running(tutorial_id: str) -> tuple[str, dict[str, Any]]:
     """
     Send a telemetry event for a tutorial, if telemetry is enabled.
 

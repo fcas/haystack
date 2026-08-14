@@ -4,7 +4,7 @@
 
 import re
 import string
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from haystack import component
 
@@ -12,29 +12,38 @@ from haystack import component
 @component
 class TextCleaner:
     """
-    A PreProcessor component to clean text data.
+    Cleans text strings.
 
-    It can remove substrings matching a list of regular expressions, convert text to lowercase, remove punctuation,
-    and remove numbers.
+    It can remove substrings matching a list of regular expressions, convert text to lowercase,
+    remove punctuation, and remove numbers.
+    Use it to clean up text data before evaluation.
 
-    This is useful to clean up text data before evaluation.
+    ### Usage example
+
+    ```python
+    from haystack.components.preprocessors import TextCleaner
+
+    text_to_clean = "1Moonlight shimmered softly, 300 Wolves howled nearby, Night enveloped everything."
+
+    cleaner = TextCleaner(convert_to_lowercase=True, remove_punctuation=False, remove_numbers=True)
+    result = cleaner.run(texts=[text_to_clean])
+    ```
     """
 
     def __init__(
         self,
-        remove_regexps: Optional[List[str]] = None,
+        remove_regexps: list[str] | None = None,
         convert_to_lowercase: bool = False,
         remove_punctuation: bool = False,
         remove_numbers: bool = False,
-    ):
+    ) -> None:
         """
-        Initialize the TextCleaner component.
+        Initializes the TextCleaner component.
 
-        :param remove_regexps: A list of regular expressions. If provided, it removes substrings
-            matching these regular expressions from the text.
-        :param convert_to_lowercase: If True, converts all characters to lowercase.
-        :param remove_punctuation: If True, removes punctuation from the text.
-        :param remove_numbers: If True, removes numerical digits from the text.
+        :param remove_regexps: A list of regex patterns to remove matching substrings from the text.
+        :param convert_to_lowercase: If `True`, converts all characters to lowercase.
+        :param remove_punctuation: If `True`, removes punctuation from the text.
+        :param remove_numbers: If `True`, removes numerical digits from the text.
         """
         self._remove_regexps = remove_regexps
         self._convert_to_lowercase = convert_to_lowercase
@@ -52,8 +61,8 @@ class TextCleaner:
 
         self._translator = str.maketrans("", "", to_remove) if to_remove else None
 
-    @component.output_types(texts=List[str])
-    def run(self, texts: List[str]) -> Dict[str, Any]:
+    @component.output_types(texts=list[str])
+    def run(self, texts: list[str]) -> dict[str, Any]:
         """
         Cleans up the given list of strings.
 

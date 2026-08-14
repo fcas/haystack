@@ -1,21 +1,29 @@
 headerPath = "license-header.txt"
 
 excludes = [
-    ".github",
-    "docker",
-    "docs",
-    "examples",
-    "proposals",
-    "releasenotes",
-    "test",
-    "CITATION.cff",
+    ".clusterfuzzlite",
+    "*.csv",
+    "*.feature",
+    "*.html",
     "*.ini",
     "*.jinja2",
     "*.md",
+    "*.mp3",
+    "*.msg",
     "*.toml",
     "*.txt",
-    "*.yaml",
+    "*.typed",
     "*.wav",
+    "*.yaml",
+    "*.yml",
+    ".github",
+    "CITATION.cff",
+    "docker",
+    "docs",
+    "docs-website",
+    "examples",
+    "proposals",
+    "releasenotes",
 ]
 
 [properties]

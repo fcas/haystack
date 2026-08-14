@@ -8,13 +8,28 @@ import logging
 import os
 import sys
 import typing
-from typing import Any, List, Optional
+from collections.abc import Sequence
+from typing import Any
+
+import haystack.utils.jupyter
 
 if typing.TYPE_CHECKING:
     from structlog.typing import EventDict, Processor, WrappedLogger
 
 HAYSTACK_LOGGING_USE_JSON_ENV_VAR = "HAYSTACK_LOGGING_USE_JSON"
 HAYSTACK_LOGGING_IGNORE_STRUCTLOG_ENV_VAR = "HAYSTACK_LOGGING_IGNORE_STRUCTLOG"
+
+# Attribute set on a logger once we have patched its methods. `logging.getLogger` returns a shared singleton, so we
+# use this marker to patch each logger only once and avoid wrapping the already-wrapped methods on repeated calls.
+_PATCHED_MARKER = "_haystack_patched"
+
+# Name of the formatting handler we install. We use it to find and remove our own handler across (re)configurations.
+_HANDLER_NAME = "HaystackLoggingHandler"
+
+
+def _is_haystack_logging_handler(handler: logging.Handler) -> bool:
+    """Return whether the given handler is the one installed by `configure_logging`."""
+    return isinstance(handler, logging.StreamHandler) and getattr(handler, "name", None) == _HANDLER_NAME
 
 
 class PatchedLogger(typing.Protocol):
@@ -138,8 +153,8 @@ def patch_log_method_to_kwargs_only(func: typing.Callable) -> typing.Callable:
 
     @functools.wraps(func)
     def _log_only_with_kwargs(
-        msg, *, _: Any = None, exc_info: Any = None, stack_info: Any = False, stacklevel: int = 1, **kwargs: Any
-    ) -> Any:  # we need the `_` to avoid a syntax error
+        msg: str, *, _: Any = None, exc_info: Any = None, stack_info: Any = False, stacklevel: int = 1, **kwargs: Any
+    ) -> typing.Callable:  # we need the `_` to avoid a syntax error
         existing_extra = kwargs.pop("extra", {})
         return func(
             # we need to increase the stacklevel by 1 to point to the correct caller
@@ -159,15 +174,15 @@ def patch_log_with_level_method_to_kwargs_only(func: typing.Callable) -> typing.
 
     @functools.wraps(func)
     def _log_only_with_kwargs(
-        level,
-        msg,
+        level: int | str,
+        msg: str,
         *,
         _: Any = None,
         exc_info: Any = None,
         stack_info: Any = False,
         stacklevel: int = 1,
         **kwargs: Any,  # we need the `_` to avoid a syntax error
-    ) -> Any:
+    ) -> typing.Callable:
         existing_extra = kwargs.pop("extra", {})
 
         return func(
@@ -188,9 +203,23 @@ def patch_make_records_to_use_kwarg_string_interpolation(original_make_records: 
     """A decorator to ensure string interpolation is used."""
 
     @functools.wraps(original_make_records)
-    def _wrapper(name, level, fn, lno, msg, args, exc_info, func=None, extra=None, sinfo=None) -> Any:
+    def _wrapper(
+        name: str,
+        level: int | str,
+        fn: str,
+        lno: int,
+        msg: str,
+        args: Any,  # noqa: ARG001
+        exc_info: Any,
+        func: Any = None,
+        extra: Any = None,
+        sinfo: Any = None,
+    ) -> typing.Callable:
         safe_extra = extra or {}
-        interpolated_msg = msg.format(**safe_extra)
+        try:
+            interpolated_msg = msg.format(**safe_extra)
+        except (KeyError, ValueError, IndexError):
+            interpolated_msg = msg
         return original_make_records(name, level, fn, lno, interpolated_msg, (), exc_info, func, extra, sinfo)
 
     return _wrapper
@@ -206,17 +235,12 @@ def _patch_structlog_call_information(logger: logging.Logger) -> None:
         if not isinstance(logger, _FixedFindCallerLogger):
             return
 
-        # completely copied from structlog. We only add `haystack.logging` to the list of ignored frames
-        # pylint: disable=unused-variable
-        def findCaller(stack_info: bool = False, stacklevel: int = 1) -> typing.Tuple[str, int, str, Optional[str]]:
-            try:
-                sinfo: Optional[str]
-                # we need to exclude `haystack.logging` from the stack
-                f, name = _find_first_app_frame_and_name(["logging", "haystack.logging"])
-                sinfo = _format_stack(f) if stack_info else None
-            except Exception as error:
-                print(f"Error in findCaller: {error}")
-
+        # Copied from structlog's `_FixedFindCallerLogger.findCaller`, adding `haystack.logging` to the ignored
+        # frames. We don't forward `stacklevel` to `_find_first_app_frame_and_name` (added in structlog 25.5.0):
+        # structlog is optional and may be older.
+        def findCaller(stack_info: bool = False, stacklevel: int = 1) -> tuple[str, int, str, str | None]:  # noqa: ARG001
+            f, _name = _find_first_app_frame_and_name(["logging", "haystack.logging"])
+            sinfo = _format_stack(f) if stack_info else None
             return f.f_code.co_filename, f.f_lineno, f.f_code.co_name, sinfo
 
         logger.findCaller = findCaller  # type: ignore
@@ -234,6 +258,11 @@ def getLogger(name: str) -> PatchedLogger:
         - it makes structure logging effective, not just an available feature
     """
     logger = logging.getLogger(name)
+    if getattr(logger, _PATCHED_MARKER, False):
+        # Already patched: `logging.getLogger` returned the same singleton, so re-patching would stack the wrappers
+        # and interpolate the message more than once.
+        return typing.cast(PatchedLogger, logger)
+
     logger.debug = patch_log_method_to_kwargs_only(logger.debug)  # type: ignore
     logger.info = patch_log_method_to_kwargs_only(logger.info)  # type: ignore
     logger.warn = patch_log_method_to_kwargs_only(logger.warn)  # type: ignore
@@ -248,6 +277,8 @@ def getLogger(name: str) -> PatchedLogger:
 
     # We also patch the `makeRecord` method to use keyword string interpolation
     logger.makeRecord = patch_make_records_to_use_kwarg_string_interpolation(logger.makeRecord)  # type: ignore
+
+    setattr(logger, _PATCHED_MARKER, True)
 
     return typing.cast(PatchedLogger, logger)
 
@@ -282,7 +313,12 @@ def correlate_logs_with_traces(_: "WrappedLogger", __: str, event_dict: "EventDi
     return event_dict
 
 
-def configure_logging(use_json: Optional[bool] = None) -> None:
+def configure_logging(
+    use_json: bool | None = None,
+    logger_name: str | Sequence[str] = ("haystack", "haystack_integrations", "haystack_experimental"),
+    propagate: bool = True,
+    configure_structlog: bool = True,
+) -> None:
     """
     Configure logging for Haystack.
 
@@ -293,9 +329,27 @@ def configure_logging(use_json: Optional[bool] = None) -> None:
     - If `structlog` is installed, you can JSON format all logs. Enable this by
         - setting the `use_json` parameter to `True` when calling this function
         - setting the environment variable `HAYSTACK_LOGGING_USE_JSON` to `true`
-    """
-    import haystack.utils.jupyter  # to avoid circular imports
 
+    :param use_json: Whether to format logs as JSON. If `None`, we try to guess based on the environment.
+    :param logger_name:
+        The name (or names) of the logger our formatting handler is attached to. Defaults to Haystack's own
+        namespaces (`"haystack"`, `"haystack_integrations"` and `"haystack_experimental"`), so that we only touch
+        Haystack's own loggers and leave the logging configuration of the host application and any other libraries
+        running in the same process untouched. Pass an empty string (`""`) to attach the handler to the root logger
+        instead - this restores the legacy behavior of formatting *every* log record in the process.
+    :param propagate:
+        Whether the configured loggers should propagate their records to ancestor loggers (ultimately the root
+        logger). The default (`True`) keeps records flowing to handlers configured by the host application and to
+        capturing tools such as `pytest`'s `caplog`. Set it to `False` to make Haystack fully own the output of its
+        own logs - this avoids duplicate log lines when the host application also configures the root logger. It has
+        no effect when `logger_name=""` (the root logger has no ancestors).
+    :param configure_structlog:
+        Whether to configure the process-global `structlog` (thereby taking over any configuration set up by someone
+        else). The default (`True`) is what an explicit call should do. Pass `False` (as the import-time call in
+        `haystack/__init__.py` does) to leave the global `structlog` configuration untouched and only install our own
+        scoped handler so Haystack's own logs are formatted. This keeps merely importing Haystack from reconfiguring
+        `structlog` for the host application's own native `structlog` loggers.
+    """
     try:
         import structlog
         from structlog.processors import ExceptionRenderer
@@ -325,11 +379,12 @@ def configure_logging(use_json: Optional[bool] = None) -> None:
             # User gave us an explicit value via environment variable
             use_json = use_json_env_var.lower() == "true"
 
-    shared_processors: List[Processor] = [
+    shared_processors: list[Processor] = [
         # Add the log level to the event_dict for structlog to use
         structlog.stdlib.add_log_level,
         # Adds the current timestamp in ISO format to logs
         structlog.processors.TimeStamper(fmt="iso"),
+        structlog.contextvars.merge_contextvars,
         add_line_and_file,
     ]
 
@@ -337,15 +392,23 @@ def configure_logging(use_json: Optional[bool] = None) -> None:
         # We only need that in sophisticated production setups where we want to correlate logs with traces
         shared_processors.append(correlate_logs_with_traces)
 
-    structlog.configure(
-        processors=shared_processors + [structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
-        logger_factory=structlog.stdlib.LoggerFactory(ignore_frame_names=["haystack.logging"]),
-        cache_logger_on_first_use=True,
-        # This is a filter that will filter out log entries that are below the log level of the root logger.
-        wrapper_class=structlog.make_filtering_bound_logger(min_level=logging.root.getEffectiveLevel()),
-    )
+    # `structlog.configure` is process-global: it affects every native structlog logger, not just Haystack's. We only
+    # configure it when explicitly asked (`configure_structlog`).
+    if configure_structlog:
+        structlog.configure(
+            # `filter_by_level` reads the effective level from the underlying stdlib logger on *every* call, so
+            # changes to the log level made after `configure_logging` runs (e.g. by the host app) are respected.
+            processors=[
+                structlog.stdlib.filter_by_level,
+                *shared_processors,
+                structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+            ],
+            logger_factory=structlog.stdlib.LoggerFactory(ignore_frame_names=["haystack.logging"]),
+            cache_logger_on_first_use=True,
+            wrapper_class=structlog.stdlib.BoundLogger,
+        )
 
-    renderers: List[Processor]
+    renderers: list[Processor]
     if use_json:
         renderers = [
             ExceptionRenderer(
@@ -374,16 +437,23 @@ def configure_logging(use_json: Optional[bool] = None) -> None:
     )
 
     handler = logging.StreamHandler()
-    handler.name = "HaystackLoggingHandler"
+    handler.name = _HANDLER_NAME
     # Use OUR `ProcessorFormatter` to format all `logging` entries.
     handler.setFormatter(formatter)
 
-    root_logger = logging.getLogger()
-    # avoid adding our handler twice
-    old_handlers = [
-        h
-        for h in root_logger.handlers
-        if not (isinstance(h, logging.StreamHandler) and h.name == "HaystackLoggingHandler")
-    ]
-    new_handlers = [handler, *old_handlers]
-    root_logger.handlers = new_handlers
+    # Attach the handler to the target logger(s) - Haystack's own namespaces by default (see `logger_name`).
+    logger_names = [logger_name] if isinstance(logger_name, str) else list(logger_name)
+
+    # Remove our handler from every logger that carries it before re-installing: keeps re-configuration idempotent and
+    # prevents double emission when the target changes (e.g. switching to the root logger via `logger_name=""`).
+    existing_loggers = [logging.getLogger(), *logging.Logger.manager.loggerDict.values()]
+    for existing_logger in existing_loggers:
+        if isinstance(existing_logger, logging.Logger) and any(
+            _is_haystack_logging_handler(h) for h in existing_logger.handlers
+        ):
+            existing_logger.handlers = [h for h in existing_logger.handlers if not _is_haystack_logging_handler(h)]
+
+    for name in logger_names:
+        target_logger = logging.getLogger(name)
+        target_logger.handlers = [handler, *target_logger.handlers]
+        target_logger.propagate = propagate

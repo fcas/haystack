@@ -3,25 +3,27 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from openai.lib.azure import AzureOpenAI
+from openai.lib.azure import AsyncAzureOpenAI, AzureADTokenProvider, AzureOpenAI
 
-from haystack import Document, component, default_from_dict, default_to_dict
-from haystack.utils import Secret, deserialize_secrets_inplace
+from haystack import component, default_from_dict, default_to_dict
+from haystack.components.embedders import OpenAITextEmbedder
+from haystack.utils import Secret, deserialize_callable, serialize_callable
+from haystack.utils.http_client import init_http_client
 
 
 @component
-class AzureOpenAITextEmbedder:
+class AzureOpenAITextEmbedder(OpenAITextEmbedder):
     """
-    A component for embedding strings using OpenAI models on Azure.
+    Embeds strings using OpenAI models deployed on Azure.
 
-    Usage example:
+    ### Usage example
+    <!-- test-ignore -->
     ```python
     from haystack.components.embedders import AzureOpenAITextEmbedder
 
     text_to_embed = "I love pizza!"
-
     text_embedder = AzureOpenAITextEmbedder()
 
     print(text_embedder.run(text_to_embed))
@@ -32,45 +34,70 @@ class AzureOpenAITextEmbedder:
     ```
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
-        azure_endpoint: Optional[str] = None,
-        api_version: Optional[str] = "2023-05-15",
+        azure_endpoint: str | None = None,
+        api_version: str | None = "2023-05-15",
         azure_deployment: str = "text-embedding-ada-002",
-        dimensions: Optional[int] = None,
-        api_key: Optional[Secret] = Secret.from_env_var("AZURE_OPENAI_API_KEY", strict=False),
-        azure_ad_token: Optional[Secret] = Secret.from_env_var("AZURE_OPENAI_AD_TOKEN", strict=False),
-        organization: Optional[str] = None,
+        dimensions: int | None = None,
+        api_key: Secret | None = Secret.from_env_var("AZURE_OPENAI_API_KEY", strict=False),
+        azure_ad_token: Secret | None = Secret.from_env_var("AZURE_OPENAI_AD_TOKEN", strict=False),
+        organization: str | None = None,
+        timeout: float | None = None,
+        max_retries: int | None = None,
         prefix: str = "",
         suffix: str = "",
-    ):
+        *,
+        default_headers: dict[str, str] | None = None,
+        azure_ad_token_provider: AzureADTokenProvider | None = None,
+        http_client_kwargs: dict[str, Any] | None = None,
+    ) -> None:
         """
-        Create an AzureOpenAITextEmbedder component.
+        Creates an AzureOpenAITextEmbedder component.
 
         :param azure_endpoint:
-            The endpoint of the deployed model.
+            The endpoint of the model deployed on Azure.
         :param api_version:
             The version of the API to use.
         :param azure_deployment:
-            The deployment of the model, usually matches the model name.
+            The name of the model deployed on Azure. The default model is text-embedding-ada-002.
         :param dimensions:
-            The number of dimensions the resulting output embeddings should have. Only supported in text-embedding-3 and later models.
+            The number of dimensions the resulting output embeddings should have. Only supported in text-embedding-3
+            and later models.
         :param api_key:
-            The API key used for authentication.
+            The Azure OpenAI API key.
+            You can set it with an environment variable `AZURE_OPENAI_API_KEY`, or pass with this
+            parameter during initialization.
         :param azure_ad_token:
-            Microsoft Entra ID token, see Microsoft's official
+            Microsoft Entra ID token, see Microsoft's
             [Entra ID](https://www.microsoft.com/en-us/security/business/identity-access/microsoft-entra-id)
-            documentation for more information.
-            Used to be called Azure Active Directory.
+            documentation for more information. You can set it with an environment variable
+            `AZURE_OPENAI_AD_TOKEN`, or pass with this parameter during initialization.
+            Previously called Azure Active Directory.
         :param organization:
-            The Organization ID. See OpenAI's
-            [production best practices](https://platform.openai.com/docs/guides/production-best-practices/setting-up-your-organization)
+            Your organization ID. See OpenAI's
+            [Setting Up Your Organization](https://platform.openai.com/docs/guides/production-best-practices/setting-up-your-organization)
             for more information.
+        :param timeout: The timeout for `AzureOpenAI` client calls, in seconds.
+            If not set, defaults to either the
+            `OPENAI_TIMEOUT` environment variable, or 30 seconds.
+        :param max_retries: Maximum number of retries to contact AzureOpenAI after an internal error.
+            If not set, defaults to either the `OPENAI_MAX_RETRIES` environment variable, or to 5 retries.
         :param prefix:
             A string to add at the beginning of each text.
         :param suffix:
             A string to add at the end of each text.
+        :param default_headers: Default headers to send to the AzureOpenAI client.
+        :param azure_ad_token_provider: A function that returns an Azure Active Directory token, will be invoked on
+            every request.
+        :param http_client_kwargs:
+            A dictionary of keyword arguments to configure a custom `httpx.Client`or `httpx.AsyncClient`.
+            For more information, see the [HTTPX documentation](https://www.python-httpx.org/api/#client).
+
         """
+        # We intentionally do not call super().__init__ here because we only need to instantiate the client to interact
+        # with the API.
+
         # Why is this here?
         # AzureOpenAI init is forcing us to use an init method that takes either base_url or azure_endpoint as not
         # None init parameters. This way we accommodate the use case where env var AZURE_OPENAI_ENDPOINT is set instead
@@ -82,38 +109,95 @@ class AzureOpenAITextEmbedder:
         if api_key is None and azure_ad_token is None:
             raise ValueError("Please provide an API key or an Azure Active Directory token.")
 
-        self.api_key = api_key
+        self.api_key = api_key  # type: ignore[assignment] # mypy does not understand that api_key can be None
         self.azure_ad_token = azure_ad_token
         self.api_version = api_version
         self.azure_endpoint = azure_endpoint
         self.azure_deployment = azure_deployment
+        self.model = azure_deployment
         self.dimensions = dimensions
         self.organization = organization
+        self.timeout = timeout
+        self.max_retries = max_retries
         self.prefix = prefix
         self.suffix = suffix
+        self.default_headers = default_headers or {}
+        self.azure_ad_token_provider = azure_ad_token_provider
+        self.http_client_kwargs = http_client_kwargs
 
-        self._client = AzureOpenAI(
-            api_version=api_version,
-            azure_endpoint=azure_endpoint,
-            azure_deployment=azure_deployment,
-            api_key=api_key.resolve_value() if api_key is not None else None,
-            azure_ad_token=azure_ad_token.resolve_value() if azure_ad_token is not None else None,
-            organization=organization,
+        self.client: AzureOpenAI | None = None
+        self.async_client: AsyncAzureOpenAI | None = None
+
+    def _client_kwargs(self) -> dict[str, Any]:
+        timeout = self.timeout if self.timeout is not None else float(os.environ.get("OPENAI_TIMEOUT", "30.0"))
+        max_retries = (
+            self.max_retries if self.max_retries is not None else int(os.environ.get("OPENAI_MAX_RETRIES", "5"))
         )
+        return {
+            "api_version": self.api_version,
+            "azure_endpoint": self.azure_endpoint,
+            "azure_deployment": self.azure_deployment,
+            "azure_ad_token_provider": self.azure_ad_token_provider,
+            "api_key": self.api_key.resolve_value() if self.api_key is not None else None,
+            "azure_ad_token": self.azure_ad_token.resolve_value() if self.azure_ad_token is not None else None,
+            "organization": self.organization,
+            "timeout": timeout,
+            "max_retries": max_retries,
+            "default_headers": self.default_headers,
+        }
 
-    def _get_telemetry_data(self) -> Dict[str, Any]:
+    def warm_up(self) -> None:
         """
-        Data that is sent to Posthog for usage analytics.
+        Initializes the synchronous Azure OpenAI client.
         """
-        return {"model": self.azure_deployment}
+        if self.client is None:
+            # openai>=3 annotates http_client as httpx2, but legacy httpx clients are supported at runtime.
+            # https://github.com/openai/openai-python/blob/main/httpx2.md
+            http_client = init_http_client(self.http_client_kwargs, async_client=False)
+            self.client = AzureOpenAI(
+                http_client=http_client,  # type: ignore[arg-type]
+                **self._client_kwargs(),
+            )
 
-    def to_dict(self) -> Dict[str, Any]:
+    async def warm_up_async(self) -> None:  # noqa: RUF029
+        """
+        Initializes the asynchronous Azure OpenAI client on the serving event loop.
+        """
+        if self.async_client is None:
+            # openai>=3 annotates http_client as httpx2, but legacy httpx clients are supported at runtime.
+            # https://github.com/openai/openai-python/blob/main/httpx2.md
+            http_client = init_http_client(self.http_client_kwargs, async_client=True)
+            self.async_client = AsyncAzureOpenAI(
+                http_client=http_client,  # type: ignore[arg-type]
+                **self._client_kwargs(),
+            )
+
+    def close(self) -> None:
+        """
+        Releases the synchronous Azure OpenAI client.
+        """
+        if self.client is not None:
+            self.client.close()
+            self.client = None
+
+    async def close_async(self) -> None:
+        """
+        Releases the asynchronous Azure OpenAI client.
+        """
+        if self.async_client is not None:
+            await self.async_client.close()
+            self.async_client = None
+
+    def to_dict(self) -> dict[str, Any]:
         """
         Serializes the component to a dictionary.
 
         :returns:
             Dictionary with serialized data.
         """
+        azure_ad_token_provider_name = None
+        if self.azure_ad_token_provider:
+            azure_ad_token_provider_name = serialize_callable(self.azure_ad_token_provider)
         return default_to_dict(
             self,
             azure_endpoint=self.azure_endpoint,
@@ -123,12 +207,17 @@ class AzureOpenAITextEmbedder:
             api_version=self.api_version,
             prefix=self.prefix,
             suffix=self.suffix,
-            api_key=self.api_key.to_dict() if self.api_key is not None else None,
-            azure_ad_token=self.azure_ad_token.to_dict() if self.azure_ad_token is not None else None,
+            api_key=self.api_key,
+            azure_ad_token=self.azure_ad_token,
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+            default_headers=self.default_headers,
+            azure_ad_token_provider=azure_ad_token_provider_name,
+            http_client_kwargs=self.http_client_kwargs,
         )
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "AzureOpenAITextEmbedder":
+    def from_dict(cls, data: dict[str, Any]) -> "AzureOpenAITextEmbedder":
         """
         Deserializes the component from a dictionary.
 
@@ -137,42 +226,9 @@ class AzureOpenAITextEmbedder:
         :returns:
             Deserialized component.
         """
-        deserialize_secrets_inplace(data["init_parameters"], keys=["api_key", "azure_ad_token"])
-        return default_from_dict(cls, data)
-
-    @component.output_types(embedding=List[float], meta=Dict[str, Any])
-    def run(self, text: str):
-        """
-        Embed a single string.
-
-        :param text:
-            Text to embed.
-
-        :returns:
-            A dictionary with the following keys:
-            - `embedding`: The embedding of the input text.
-            - `meta`: Information about the usage of the model.
-        """
-        if not isinstance(text, str):
-            # Check if input is a list and all elements are instances of Document
-            if isinstance(text, list) and all(isinstance(elem, Document) for elem in text):
-                error_message = "Input must be a string. Use AzureOpenAIDocumentEmbedder for a list of Documents."
-            else:
-                error_message = "Input must be a string."
-            raise TypeError(error_message)
-
-        # Preprocess the text by adding prefixes/suffixes
-        # finally, replace newlines as recommended by OpenAI docs
-        processed_text = f"{self.prefix}{text}{self.suffix}".replace("\n", " ")
-
-        if self.dimensions is not None:
-            response = self._client.embeddings.create(
-                model=self.azure_deployment, dimensions=self.dimensions, input=processed_text
+        serialized_azure_ad_token_provider = data["init_parameters"].get("azure_ad_token_provider")
+        if serialized_azure_ad_token_provider:
+            data["init_parameters"]["azure_ad_token_provider"] = deserialize_callable(
+                serialized_azure_ad_token_provider
             )
-        else:
-            response = self._client.embeddings.create(model=self.azure_deployment, input=processed_text)
-
-        return {
-            "embedding": response.data[0].embedding,
-            "meta": {"model": response.model, "usage": dict(response.usage)},
-        }
+        return default_from_dict(cls, data)

@@ -2,20 +2,17 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Dict, Type, Union
+from typing import Any
 
-from haystack import logging
 from haystack.core.type_utils import _type_name
 
 from .types import InputSocket, OutputSocket
 
-logger = logging.getLogger(__name__)
-
-SocketsDict = Dict[str, Union[InputSocket, OutputSocket]]
-SocketsIOType = Union[Type[InputSocket], Type[OutputSocket]]
+SocketsDict = dict[str, InputSocket | OutputSocket]
+SocketsIOType = type[InputSocket] | type[OutputSocket]
 
 
-class Sockets:
+class Sockets:  # noqa: PLW1641
     """
     Represents the inputs or outputs of a `Component`.
 
@@ -44,12 +41,12 @@ class Sockets:
     sockets = {"question": InputSocket("question", Any), "documents": InputSocket("documents", Any)}
     inputs = Sockets(component=prompt_builder, sockets_dict=sockets, sockets_io_type=InputSocket)
     inputs
-    >>> Inputs:
-    >>>   - question: Any
-    >>>   - documents: Any
+    # >> Inputs:
+    # >>   - question: Any
+    # >>   - documents: Any
 
     inputs.question
-    >>> InputSocket(name='question', type=typing.Any, default_value=<class 'haystack.core.component.types._empty'>, is_variadic=False, senders=[])
+    # >> InputSocket(name='question', type=typing.Any, default_value=<class 'haystack.core.component.types._empty'>, ...
     ```
     """
 
@@ -59,7 +56,7 @@ class Sockets:
         component: "Component",  # type: ignore[name-defined] # noqa: F821
         sockets_dict: SocketsDict,
         sockets_io_type: SocketsIOType,
-    ):
+    ) -> None:
         """
         Create a new Sockets object.
 
@@ -80,7 +77,17 @@ class Sockets:
         self._sockets_dict = sockets_dict
         self.__dict__.update(sockets_dict)
 
-    def __setitem__(self, key: str, socket: Union[InputSocket, OutputSocket]):
+    def __eq__(self, value: object) -> bool:
+        if not isinstance(value, Sockets):
+            return False
+
+        return (
+            self._sockets_io_type == value._sockets_io_type
+            and self._component == value._component
+            and self._sockets_dict == value._sockets_dict
+        )
+
+    def __setitem__(self, key: str, socket: InputSocket | OutputSocket) -> None:
         """
         Adds a new socket to this Sockets object.
 
@@ -90,8 +97,24 @@ class Sockets:
         self._sockets_dict[key] = socket
         self.__dict__[key] = socket
 
+    def __contains__(self, key: str) -> bool:
+        return key in self._sockets_dict
+
+    def get(self, key: str, default: InputSocket | OutputSocket | None = None) -> InputSocket | OutputSocket | None:
+        """
+        Get a socket from the Sockets object.
+
+        :param key:
+            The name of the socket to get.
+        :param default:
+            The value to return if the key is not found.
+        :returns:
+            The socket with the given key or `default` if the key is not found.
+        """
+        return self._sockets_dict.get(key, default)
+
     def _component_name(self) -> str:
-        if pipeline := getattr(self._component, "__haystack_added_to_pipeline__"):
+        if pipeline := self._component.__haystack_added_to_pipeline__:
             # This Component has been added in a Pipeline, let's get the name from there.
             return pipeline.get_component_name(self._component)
 
@@ -100,7 +123,7 @@ class Sockets:
         # __repr__ method and that would lead to infinite recursion since we call Sockets.__repr__ in it.
         return object.__repr__(self._component)
 
-    def __getattribute__(self, name):
+    def __getattribute__(self, name: Any) -> Any:
         try:
             sockets = object.__getattribute__(self, "_sockets")
             if name in sockets:

@@ -2,13 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import importlib
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from haystack import DeserializationError, Document, component, default_from_dict, default_to_dict, logging
+from haystack import Document, component, default_from_dict, default_to_dict
 from haystack.document_stores.types import DocumentStore, DuplicatePolicy
-
-logger = logging.getLogger(__name__)
 
 
 @component
@@ -16,7 +13,7 @@ class DocumentWriter:
     """
     Writes documents to a DocumentStore.
 
-    Usage example:
+    ### Usage example
     ```python
     from haystack import Document
     from haystack.components.writers import DocumentWriter
@@ -25,43 +22,44 @@ class DocumentWriter:
         Document(content="Python is a popular programming language"),
     ]
     doc_store = InMemoryDocumentStore()
-    doc_store.write_documents(docs)
+    writer = DocumentWriter(document_store=doc_store)
+    writer.run(docs)
     ```
     """
 
-    def __init__(self, document_store: DocumentStore, policy: DuplicatePolicy = DuplicatePolicy.NONE):
+    def __init__(self, document_store: DocumentStore, policy: DuplicatePolicy = DuplicatePolicy.NONE) -> None:
         """
         Create a DocumentWriter component.
 
         :param document_store:
-            The DocumentStore where the documents are to be written.
+            The instance of the document store where you want to store your documents.
         :param policy:
-            The policy to apply when a Document with the same id already exists in the DocumentStore.
-            - `DuplicatePolicy.NONE`: Default policy, behaviour depends on the Document Store.
-            - `DuplicatePolicy.SKIP`: If a Document with the same id already exists, it is skipped and not written.
-            - `DuplicatePolicy.OVERWRITE`: If a Document with the same id already exists, it is overwritten.
-            - `DuplicatePolicy.FAIL`: If a Document with the same id already exists, an error is raised.
+            The policy to apply when a Document with the same ID already exists in the DocumentStore.
+            - `DuplicatePolicy.NONE`: Default policy, relies on the DocumentStore settings.
+            - `DuplicatePolicy.SKIP`: Skips documents with the same ID and doesn't write them to the DocumentStore.
+            - `DuplicatePolicy.OVERWRITE`: Overwrites documents with the same ID.
+            - `DuplicatePolicy.FAIL`: Raises an error if a Document with the same ID is already in the DocumentStore.
         """
         self.document_store = document_store
         self.policy = policy
 
-    def _get_telemetry_data(self) -> Dict[str, Any]:
+    def _get_telemetry_data(self) -> dict[str, Any]:
         """
         Data that is sent to Posthog for usage analytics.
         """
         return {"document_store": type(self.document_store).__name__}
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """
         Serializes the component to a dictionary.
 
         :returns:
             Dictionary with serialized data.
         """
-        return default_to_dict(self, document_store=self.document_store.to_dict(), policy=self.policy.name)
+        return default_to_dict(self, document_store=self.document_store, policy=self.policy.name)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "DocumentWriter":
+    def from_dict(cls, data: dict[str, Any]) -> "DocumentWriter":
         """
         Deserializes the component from a dictionary.
 
@@ -74,38 +72,21 @@ class DocumentWriter:
             If the document store is not properly specified in the serialization data or its type cannot be imported.
         """
         init_params = data.get("init_parameters", {})
-        if "document_store" not in init_params:
-            raise DeserializationError("Missing 'document_store' in serialization data")
-        if "type" not in init_params["document_store"]:
-            raise DeserializationError("Missing 'type' in document store's serialization data")
-
-        try:
-            module_name, type_ = init_params["document_store"]["type"].rsplit(".", 1)
-            logger.debug("Trying to import module '{module_name}'", module_name=module_name)
-            module = importlib.import_module(module_name)
-        except (ImportError, DeserializationError) as e:
-            raise DeserializationError(
-                f"DocumentStore of type '{init_params['document_store']['type']}' not correctly imported"
-            ) from e
-
-        docstore_class = getattr(module, type_)
-        docstore = docstore_class.from_dict(init_params["document_store"])
-
-        data["init_parameters"]["document_store"] = docstore
-        data["init_parameters"]["policy"] = DuplicatePolicy[data["init_parameters"]["policy"]]
+        if "policy" in init_params:
+            init_params["policy"] = DuplicatePolicy[init_params["policy"]]
         return default_from_dict(cls, data)
 
     @component.output_types(documents_written=int)
-    def run(self, documents: List[Document], policy: Optional[DuplicatePolicy] = None):
+    def run(self, documents: list[Document], policy: DuplicatePolicy | None = None) -> dict[str, int]:
         """
         Run the DocumentWriter on the given input data.
 
         :param documents:
-            A list of documents to write to the store.
+            A list of documents to write to the document store.
         :param policy:
             The policy to use when encountering duplicate documents.
         :returns:
-            Number of documents written
+            Number of documents written to the document store.
 
         :raises ValueError:
             If the specified document store is not found.
@@ -115,3 +96,46 @@ class DocumentWriter:
 
         documents_written = self.document_store.write_documents(documents=documents, policy=policy)
         return {"documents_written": documents_written}
+
+    @component.output_types(documents_written=int)
+    async def run_async(self, documents: list[Document], policy: DuplicatePolicy | None = None) -> dict[str, int]:
+        """
+        Asynchronously run the DocumentWriter on the given input data.
+
+        This is the asynchronous version of the `run` method. It has the same parameters and return values
+        but can be used with `await` in async code.
+
+        :param documents:
+            A list of documents to write to the document store.
+        :param policy:
+            The policy to use when encountering duplicate documents.
+        :returns:
+            Number of documents written to the document store.
+
+        :raises ValueError:
+            If the specified document store is not found.
+        :raises TypeError:
+            If the specified document store does not implement `write_documents_async`.
+        """
+        if policy is None:
+            policy = self.policy
+
+        if not hasattr(self.document_store, "write_documents_async"):
+            raise TypeError(f"Document store {type(self.document_store).__name__} does not provide async support.")
+
+        documents_written = await self.document_store.write_documents_async(documents=documents, policy=policy)
+        return {"documents_written": documents_written}
+
+    def close(self) -> None:
+        """
+        Release the synchronous resources of the underlying Document Store.
+        """
+        if hasattr(self.document_store, "close"):
+            self.document_store.close()
+
+    async def close_async(self) -> None:
+        """
+        Release the asynchronous resources of the underlying Document Store.
+        """
+        if hasattr(self.document_store, "close_async"):
+            await self.document_store.close_async()

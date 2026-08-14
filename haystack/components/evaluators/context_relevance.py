@@ -2,123 +2,170 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Dict, List, Optional
+import math
+from statistics import mean
+from typing import Any
 
-from numpy import mean as np_mean
-
-from haystack import default_from_dict
+from haystack import component, default_from_dict, default_to_dict, logging
 from haystack.components.evaluators.llm_evaluator import LLMEvaluator
-from haystack.core.component import component
-from haystack.utils import Secret, deserialize_secrets_inplace
+from haystack.components.generators.chat.types import ChatGenerator
+from haystack.core.serialization import component_to_dict
+from haystack.utils import deserialize_chatgenerator_inplace
+
+logger = logging.getLogger(__name__)
 
 # Private global variable for default examples to include in the prompt if the user does not provide any examples
 _DEFAULT_EXAMPLES = [
     {
         "inputs": {
             "questions": "What is the capital of Germany?",
-            "contexts": ["Berlin is the capital of Germany and was founded in 1244."],
+            "contexts": ["Berlin is the capital of Germany. Berlin and was founded in 1244."],
         },
-        "outputs": {
-            "statements": ["Berlin is the capital of Germany.", "Berlin was founded in 1244."],
-            "statement_scores": [1, 0],
-        },
+        "outputs": {"relevant_statements": ["Berlin is the capital of Germany."]},
     },
     {
-        "inputs": {"questions": "What is the capital of France?", "contexts": ["Berlin is the capital of Germany."]},
-        "outputs": {"statements": ["Berlin is the capital of Germany."], "statement_scores": [0]},
+        "inputs": {
+            "questions": "What is the capital of France?",
+            "contexts": [
+                "Berlin is the capital of Germany and was founded in 1244.",
+                "Europe is a continent with 44 countries.",
+                "Madrid is the capital of Spain.",
+            ],
+        },
+        "outputs": {"relevant_statements": []},
     },
     {
         "inputs": {"questions": "What is the capital of Italy?", "contexts": ["Rome is the capital of Italy."]},
-        "outputs": {"statements": ["Rome is the capital of Italy."], "statement_scores": [1]},
+        "outputs": {"relevant_statements": ["Rome is the capital of Italy."]},
     },
 ]
 
 
+@component
 class ContextRelevanceEvaluator(LLMEvaluator):
     """
     Evaluator that checks if a provided context is relevant to the question.
 
-    An LLM separates the answer into multiple statements and checks whether the statement can be inferred from the
-    context or not. The final score for the full answer is a number from 0.0 to 1.0. It represents the proportion of
-    statements that can be inferred from the provided contexts.
+    An LLM breaks up a context into multiple statements and checks whether each statement
+    is relevant for answering a question.
+    The score for each context is either binary score of 1 or 0, where 1 indicates that the context is relevant
+    to the question and 0 indicates that the context is not relevant.
+    The evaluator also provides the relevant statements from the context and an average score over all the provided
+    input questions contexts pairs.
 
     Usage example:
     ```python
     from haystack.components.evaluators import ContextRelevanceEvaluator
 
-    questions = ["Who created the Python language?"]
+    questions = ["Who created the Python language?", "Why does Java needs a JVM?", "Is C++ better than Python?"]
     contexts = [
-        [
-            "Python, created by Guido van Rossum in the late 1980s, is a high-level general-purpose programming language. Its design philosophy emphasizes code readability, and its language constructs aim to help programmers write clear, logical code for both small and large-scale software projects."
-        ],
+        [(
+            "Python, created by Guido van Rossum in the late 1980s, is a high-level general-purpose programming "
+            "language. Its design philosophy emphasizes code readability, and its language constructs aim to help "
+            "programmers write clear, logical code for both small and large-scale software projects."
+        )],
+        [(
+            "Java is a high-level, class-based, object-oriented programming language that is designed to have as few "
+            "implementation dependencies as possible. The JVM has two primary functions: to allow Java programs to run"
+            "on any device or operating system (known as the 'write once, run anywhere' principle), and to manage and"
+            "optimize program memory."
+        )],
+        [(
+            "C++ is a general-purpose programming language created by Bjarne Stroustrup as an extension of the C "
+            "programming language."
+        )],
     ]
 
     evaluator = ContextRelevanceEvaluator()
     result = evaluator.run(questions=questions, contexts=contexts)
     print(result["score"])
-    # 1.0
+    # 0.67
     print(result["individual_scores"])
-    # [1.0]
+    # [1,1,0]
     print(result["results"])
-    # [{'statements': ['Python, created by Guido van Rossum in the late 1980s.'], 'statement_scores': [1], 'score': 1.0}]
+    # [{
+    #   'relevant_statements': ['Python, created by Guido van Rossum in the late 1980s.'],
+    #   'score': 1.0,
+    #   'status': 'evaluated'
+    #  },
+    #  {
+    #   'relevant_statements': ['The JVM has two primary functions: to allow Java programs to run on any device or
+    #                           operating system (known as the "write once, run anywhere" principle), and to manage and
+    #                           optimize program memory'],
+    #   'score': 1.0,
+    #   'status': 'evaluated'
+    #  },
+    #  {
+    #   'relevant_statements': [],
+    #   'score': 0.0,
+    #   'status': 'evaluated'
+    #  }]
     ```
     """
 
     def __init__(
         self,
-        examples: Optional[List[Dict[str, Any]]] = None,
-        api: str = "openai",
-        api_key: Secret = Secret.from_env_var("OPENAI_API_KEY"),
-    ):
+        examples: list[dict[str, Any]] | None = None,
+        progress_bar: bool = True,
+        raise_on_failure: bool = True,
+        chat_generator: ChatGenerator | None = None,
+    ) -> None:
         """
         Creates an instance of ContextRelevanceEvaluator.
+
+        If no LLM is specified using the `chat_generator` parameter, the component will use OpenAI in JSON mode.
 
         :param examples:
             Optional few-shot examples conforming to the expected input and output format of ContextRelevanceEvaluator.
             Default examples will be used if none are provided.
             Each example must be a dictionary with keys "inputs" and "outputs".
             "inputs" must be a dictionary with keys "questions" and "contexts".
-            "outputs" must be a dictionary with "statements" and "statement_scores".
+            "outputs" must be a dictionary with "relevant_statements".
             Expected format:
+            ```python
             [{
                 "inputs": {
                     "questions": "What is the capital of Italy?", "contexts": ["Rome is the capital of Italy."],
                 },
                 "outputs": {
-                    "statements": ["Rome is the capital of Italy."],
-                    "statement_scores": [1],
+                    "relevant_statements": ["Rome is the capital of Italy."],
                 },
             }]
-        :param api:
-            The API to use for calling an LLM through a Generator.
-            Supported APIs: "openai".
-        :param api_key:
-            The API key.
-
+            ```
+        :param progress_bar:
+            Whether to show a progress bar during the evaluation.
+        :param raise_on_failure:
+            Whether to raise an exception if the API call fails.
+        :param chat_generator:
+            a ChatGenerator instance which represents the LLM.
+            In order for the component to work, the LLM should be configured to return a JSON object. For example,
+            when using the OpenAIChatGenerator, you should pass `{"response_format": {"type": "json_object"}}` in the
+            `generation_kwargs`.
         """
-        self.instructions = (
-            "Your task is to judge how relevant the provided context is for answering a question. "
-            "First, please extract statements from the provided context. "
-            "Second, calculate a relevance score for each statement in the context. "
-            "The score is 1 if the statement is relevant to answer the question or 0 if it is not relevant."
-        )
-        self.inputs = [("questions", List[str]), ("contexts", List[List[str]])]
-        self.outputs = ["statements", "statement_scores"]
-        self.examples = examples or _DEFAULT_EXAMPLES
-        self.api = api
-        self.api_key = api_key
 
-        super().__init__(
+        self.instructions = (
+            "Please extract only sentences from the provided context which are absolutely relevant and "
+            "required to answer the following question. If no relevant sentences are found, or if you "
+            "believe the question cannot be answered from the given context, return an empty list, example: []"
+        )
+        self.inputs = [("questions", list[str]), ("contexts", list[list[str]])]
+        self.outputs = ["relevant_statements"]
+        self.examples = examples or _DEFAULT_EXAMPLES
+
+        super(ContextRelevanceEvaluator, self).__init__(  # noqa: UP008
             instructions=self.instructions,
             inputs=self.inputs,
             outputs=self.outputs,
             examples=self.examples,
-            api=self.api,
-            api_key=self.api_key,
+            chat_generator=chat_generator,
+            raise_on_failure=raise_on_failure,
+            progress_bar=progress_bar,
         )
 
-    @component.output_types(individual_scores=List[int], score=float, results=List[Dict[str, Any]])
-    def run(self, questions: List[str], contexts: List[List[str]]) -> Dict[str, Any]:
+    @component.output_types(
+        score=float, individual_scores=list[float], results=list[dict[str, Any]], meta=list[dict[str, Any]] | None
+    )
+    def run(self, **inputs: Any) -> dict[str, Any]:
         """
         Run the LLM evaluator.
 
@@ -130,25 +177,85 @@ class ContextRelevanceEvaluator(LLMEvaluator):
             A dictionary with the following outputs:
                 - `score`: Mean context relevance score over all the provided input questions.
                 - `individual_scores`: A list of context relevance scores for each input question.
-                - `results`: A list of dictionaries with `statements` and `statement_scores` for each input context.
+                - `results`: A list of dictionaries with `relevant_statements`, `score`, and `status` for each input
+                  context. `status` is `evaluated` for valid results and `error` for failed evaluations.
         """
-        result = super().run(questions=questions, contexts=contexts)
+        result = super(ContextRelevanceEvaluator, self).run(**inputs)  # noqa: UP008
+        # Post-process the raw results to calculate relevance metrics and scores
+        return self._postprocess_results(result)
 
-        # calculate average statement relevance score per query
-        for res in result["results"]:
-            if not res["statements"]:
-                res["score"] = 0
+    @component.output_types(
+        score=float, individual_scores=list[float], results=list[dict[str, Any]], meta=list[dict[str, Any]] | None
+    )
+    async def run_async(self, **inputs: Any) -> dict[str, Any]:
+        """
+        Run the LLM evaluator asynchronously.
+
+        :param questions:
+            A list of questions.
+        :param contexts:
+            A list of lists of contexts. Each list of contexts corresponds to one question.
+        :returns:
+            A dictionary with the following outputs:
+                - `score`: Mean context relevance score over all the provided input questions.
+                - `individual_scores`: A list of context relevance scores for each input question.
+                - `results`: A list of dictionaries with `relevant_statements`, `score`, and `status` for each input
+                  context. `status` is `evaluated` for valid results and `error` for failed evaluations.
+        """
+        result = await super(ContextRelevanceEvaluator, self).run_async(**inputs)  # noqa: UP008
+        # Post-process the raw results to calculate relevance metrics and scores
+        return self._postprocess_results(result)
+
+    def _postprocess_results(self, result: dict[str, Any]) -> dict[str, Any]:
+        """
+        Post-processes raw LLM evaluator outputs to compute context relevance scores.
+
+        Calculates binary scores based on whether relevant statements were found,
+        averages the scores across all successful queries, and updates the result payload.
+
+        :param result:
+            The raw evaluation dictionary from the base LLM evaluator.
+        :returns:
+            The updated dictionary containing final scores and tracking metrics.
+        """
+        for idx, res in enumerate(result["results"]):
+            if res is None:
+                result["results"][idx] = {"relevant_statements": [], "score": float("nan"), "status": "error"}
+                continue
+            res["status"] = "evaluated"
+            if len(res["relevant_statements"]) > 0:
+                res["score"] = 1
             else:
-                res["score"] = np_mean(res["statement_scores"])
+                res["score"] = 0
 
         # calculate average context relevance score over all queries
-        result["score"] = np_mean([res["score"] for res in result["results"]])
-        result["individual_scores"] = [res["score"] for res in result["results"]]
+        scores = [res["score"] for res in result["results"]]
+        valid_scores = [s for s in scores if not math.isnan(s)]
+        skipped = len(scores) - len(valid_scores)
+        if skipped:
+            logger.warning("{skipped} query(s) failed and were excluded from the score.", skipped=skipped)
+        result["score"] = mean(valid_scores) if valid_scores else float("nan")
+        result["individual_scores"] = scores  # useful for the EvaluationRunResult
 
         return result
 
+    def to_dict(self) -> dict[str, Any]:
+        """
+        Serialize this component to a dictionary.
+
+        :returns:
+            A dictionary with serialized data.
+        """
+        return default_to_dict(
+            self,
+            chat_generator=component_to_dict(obj=self._chat_generator, name="chat_generator"),
+            examples=self.examples,
+            progress_bar=self.progress_bar,
+            raise_on_failure=self.raise_on_failure,
+        )
+
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ContextRelevanceEvaluator":
+    def from_dict(cls, data: dict[str, Any]) -> "ContextRelevanceEvaluator":
         """
         Deserialize this component from a dictionary.
 
@@ -157,5 +264,6 @@ class ContextRelevanceEvaluator(LLMEvaluator):
         :returns:
             The deserialized component instance.
         """
-        deserialize_secrets_inplace(data["init_parameters"], keys=["api_key"])
+        if data["init_parameters"].get("chat_generator"):
+            deserialize_chatgenerator_inplace(data["init_parameters"], key="chat_generator")
         return default_from_dict(cls, data)

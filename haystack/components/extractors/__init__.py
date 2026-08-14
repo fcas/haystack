@@ -2,10 +2,16 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from haystack.components.extractors.named_entity_extractor import (
-    NamedEntityAnnotation,
-    NamedEntityExtractor,
-    NamedEntityExtractorBackend,
-)
+import sys
+from typing import TYPE_CHECKING
 
-__all__ = ["NamedEntityExtractor", "NamedEntityExtractorBackend", "NamedEntityAnnotation"]
+from lazy_imports import LazyImporter
+
+_import_structure = {"llm_metadata_extractor": ["LLMMetadataExtractor"], "regex_text_extractor": ["RegexTextExtractor"]}
+
+if TYPE_CHECKING:
+    from .llm_metadata_extractor import LLMMetadataExtractor as LLMMetadataExtractor
+    from .regex_text_extractor import RegexTextExtractor as RegexTextExtractor
+
+else:
+    sys.modules[__name__] = LazyImporter(name=__name__, module_file=__file__, import_structure=_import_structure)

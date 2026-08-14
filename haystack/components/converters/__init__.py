@@ -2,24 +2,43 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from haystack.components.converters.azure import AzureOCRDocumentConverter
-from haystack.components.converters.html import HTMLToDocument
-from haystack.components.converters.markdown import MarkdownToDocument
-from haystack.components.converters.openapi_functions import OpenAPIServiceToFunctions
-from haystack.components.converters.output_adapter import OutputAdapter
-from haystack.components.converters.pdfminer import PDFMinerToDocument
-from haystack.components.converters.pypdf import PyPDFToDocument
-from haystack.components.converters.tika import TikaDocumentConverter
-from haystack.components.converters.txt import TextFileToDocument
+import sys
+from typing import TYPE_CHECKING
 
-__all__ = [
-    "TextFileToDocument",
-    "TikaDocumentConverter",
-    "AzureOCRDocumentConverter",
-    "PyPDFToDocument",
-    "PDFMinerToDocument",
-    "HTMLToDocument",
-    "MarkdownToDocument",
-    "OpenAPIServiceToFunctions",
-    "OutputAdapter",
-]
+from lazy_imports import LazyImporter
+
+_import_structure = {
+    "csv": ["CSVToDocument"],
+    "docx": ["DOCXToDocument"],
+    "file_to_file_content": ["FileToFileContent"],
+    "html": ["HTMLToDocument"],
+    "json": ["JSONConverter"],
+    "markdown": ["MarkdownToDocument"],
+    "msg": ["MSGToDocument"],
+    "multi_file_converter": ["MultiFileConverter"],
+    "output_adapter": ["OutputAdapter"],
+    "pdfminer": ["PDFMinerToDocument"],
+    "pptx": ["PPTXToDocument"],
+    "pypdf": ["PyPDFToDocument"],
+    "txt": ["TextFileToDocument"],
+    "xlsx": ["XLSXToDocument"],
+}
+
+if TYPE_CHECKING:
+    from .csv import CSVToDocument as CSVToDocument
+    from .docx import DOCXToDocument as DOCXToDocument
+    from .file_to_file_content import FileToFileContent as FileToFileContent
+    from .html import HTMLToDocument as HTMLToDocument
+    from .json import JSONConverter as JSONConverter
+    from .markdown import MarkdownToDocument as MarkdownToDocument
+    from .msg import MSGToDocument as MSGToDocument
+    from .multi_file_converter import MultiFileConverter as MultiFileConverter
+    from .output_adapter import OutputAdapter as OutputAdapter
+    from .pdfminer import PDFMinerToDocument as PDFMinerToDocument
+    from .pptx import PPTXToDocument as PPTXToDocument
+    from .pypdf import PyPDFToDocument as PyPDFToDocument
+    from .txt import TextFileToDocument as TextFileToDocument
+    from .xlsx import XLSXToDocument as XLSXToDocument
+
+else:
+    sys.modules[__name__] = LazyImporter(name=__name__, module_file=__file__, import_structure=_import_structure)

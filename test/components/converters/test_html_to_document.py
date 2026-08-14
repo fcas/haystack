@@ -1,8 +1,10 @@
 # SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
 #
 # SPDX-License-Identifier: Apache-2.0
+
 import logging
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -36,6 +38,28 @@ class TestHTMLToDocument:
         assert len(docs) == 1
         assert "Haystack" in docs[0].content
         assert docs[0].meta["file_name"] == "what_is_haystack.html"
+
+    def test_run_with_store_full_path(self, test_files_path):
+        """
+        Test if the component runs correctly when metadata is supplied by the user.
+        """
+        converter = HTMLToDocument(store_full_path=True)
+        sources = [test_files_path / "html" / "what_is_haystack.html"]
+
+        results = converter.run(sources=sources)  # store_full_path is True by default
+        docs = results["documents"]
+
+        assert len(docs) == 1
+        assert "Haystack" in docs[0].content
+        assert docs[0].meta["file_path"] == str(sources[0])
+
+        converter_2 = HTMLToDocument(store_full_path=False)
+        results = converter_2.run(sources=sources)
+        docs = results["documents"]
+
+        assert len(docs) == 1
+        assert "Haystack" in docs[0].content
+        assert docs[0].meta["file_path"] == "what_is_haystack.html"
 
     def test_incorrect_meta(self, test_files_path):
         """
@@ -132,6 +156,23 @@ class TestHTMLToDocument:
             assert "Could not read non_existing_file.html" in caplog.text
             assert results["documents"] == []
 
+    def test_run_empty_bytestream(self, caplog):
+        """
+        Test that an empty ByteStream is skipped without invoking extraction,
+        so no noisy lxml parse errors are emitted.
+        """
+        empty_stream = ByteStream(data=b"")
+        empty_stream.mime_type = "text/html"
+        converter = HTMLToDocument()
+
+        with patch("haystack.components.converters.html.extract") as mock_extract:
+            with caplog.at_level(logging.WARNING):
+                results = converter.run(sources=[empty_stream])
+
+        assert results["documents"] == []
+        mock_extract.assert_not_called()
+        assert "because it is empty" in caplog.text
+
     def test_mixed_sources_run(self, test_files_path):
         """
         Test if the component runs correctly if the input is a mix of paths and ByteStreams.
@@ -151,31 +192,63 @@ class TestHTMLToDocument:
         for doc in docs:
             assert "Haystack" in doc.content
 
+    def test_bytestream_encoding_from_meta(self):
+        """
+        Test that a non-UTF-8 ByteStream is decoded using the encoding specified in its meta.
+        """
+        # "caf\xe9" is "café" in latin-1; decoding as utf-8 would raise UnicodeDecodeError.
+        latin1_html = b"<html><body><p>caf\xe9</p></body></html>"
+        bytestream = ByteStream(data=latin1_html, meta={"encoding": "latin-1"})
+
+        converter = HTMLToDocument()
+        results = converter.run(sources=[bytestream])
+        docs = results["documents"]
+
+        assert len(docs) == 1
+        assert "café" in docs[0].content
+
+    def test_bytestream_encoding_from_init(self):
+        """
+        Test that the encoding passed to __init__ is used as a fallback when not set in ByteStream meta.
+        """
+        latin1_html = b"<html><body><p>caf\xe9</p></body></html>"
+        bytestream = ByteStream(data=latin1_html)
+
+        converter = HTMLToDocument(encoding="latin-1")
+        results = converter.run(sources=[bytestream])
+        docs = results["documents"]
+
+        assert len(docs) == 1
+        assert "café" in docs[0].content
+
     def test_serde(self):
         """
         Test if the component runs correctly gets serialized and deserialized.
         """
-        converter = HTMLToDocument()
+        converter = HTMLToDocument(encoding="latin-1")
         serde_data = converter.to_dict()
         new_converter = HTMLToDocument.from_dict(serde_data)
         assert new_converter.extraction_kwargs == converter.extraction_kwargs
+        assert new_converter.encoding == converter.encoding
 
     def test_run_difficult_html(self, test_files_path):
-        # boilerpy3's DefaultExtractor fails to extract text from this HTML file
-
         converter = HTMLToDocument()
         result = converter.run(sources=[Path(test_files_path / "html" / "paul_graham_superlinear.html")])
 
         assert len(result["documents"]) == 1
         assert "Superlinear" in result["documents"][0].content
 
-    def test_run_with_extraction_kwargs(self, test_files_path):
+    @patch("haystack.components.converters.html.extract", return_value="test")
+    def test_run_with_extraction_kwargs(self, mock_extract, test_files_path):
         sources = [test_files_path / "html" / "what_is_haystack.html"]
 
         converter = HTMLToDocument()
+        converter.run(sources=sources)
+        assert mock_extract.call_count == 1
+        assert "favor_precision" not in mock_extract.call_args[1]
+
         precise_converter = HTMLToDocument(extraction_kwargs={"favor_precision": True})
-
-        doc = converter.run(sources=sources)["documents"][0]
-        precise_doc = precise_converter.run(sources=sources)["documents"][0]
-
-        assert len(doc.content) > len(precise_doc.content)
+        mock_extract.reset_mock()
+        precise_converter.run(sources=sources)
+        assert mock_extract.call_count == 1
+        assert mock_extract.call_args[1]["favor_precision"] is True

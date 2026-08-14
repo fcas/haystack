@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import TracebackType
-from typing import Optional, Type
 
 from lazy_imports.try_import import _DeferredImportExceptionContextManager
 
@@ -12,9 +11,13 @@ DEFAULT_IMPORT_ERROR_MSG = "Try 'pip install {}'"
 
 class LazyImport(_DeferredImportExceptionContextManager):
     """
-    Wrapper on top of lazy_import's _DeferredImportExceptionContextManager.
+    A context manager that provides controlled handling of import errors.
 
     It adds the possibility to customize the error messages.
+
+    NOTE: Despite its name, this class does not delay the actual import operation.
+    For installed modules: executes the import immediately.
+    For uninstalled modules: captures the error and defers it until check() is called.
     """
 
     def __init__(self, message: str = DEFAULT_IMPORT_ERROR_MSG) -> None:
@@ -22,8 +25,8 @@ class LazyImport(_DeferredImportExceptionContextManager):
         self.import_error_msg = message
 
     def __exit__(
-        self, exc_type: Optional[Type[Exception]], exc_value: Optional[Exception], traceback: Optional[TracebackType]
-    ) -> Optional[bool]:
+        self, exc_type: type[Exception] | None, exc_value: Exception | None, traceback: TracebackType | None
+    ) -> bool | None:
         """
         Exit the context manager.
 
@@ -42,8 +45,8 @@ class LazyImport(_DeferredImportExceptionContextManager):
         """
         if isinstance(exc_value, ImportError):
             message = (
-                f"Failed to import '{exc_value.name}'. {self.import_error_msg.format(exc_value.name)}. "
-                f"Original error: {exc_value}"
+                f"Haystack failed to import the optional dependency '{exc_value.name}'. "
+                f"{self.import_error_msg.format(exc_value.name)}. Original error: {exc_value}"
             )
             self._deferred = (exc_value, message)
             return True

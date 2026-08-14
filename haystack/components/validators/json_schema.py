@@ -3,14 +3,26 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any
+
+from jsonschema import ValidationError, validate
 
 from haystack import component
 from haystack.dataclasses import ChatMessage
-from haystack.lazy_imports import LazyImport
 
-with LazyImport(message="Run 'pip install jsonschema'") as jsonschema_import:
-    from jsonschema import ValidationError, validate
+
+def is_valid_json(s: str) -> bool:
+    """
+    Check if the provided string is a valid JSON.
+
+    :param s: The string to be checked.
+    :returns: `True` if the string is a valid JSON; otherwise, `False`.
+    """
+    try:
+        json.loads(s)
+    except ValueError:
+        return False
+    return True
 
 
 @component
@@ -26,11 +38,9 @@ class JsonSchemaValidator:
     Usage example:
 
     ```python
-    from typing import List
-
     from haystack import Pipeline
     from haystack.components.generators.chat import OpenAIChatGenerator
-    from haystack.components.others import Multiplexer
+    from haystack.components.joiners import BranchJoiner
     from haystack.components.validators import JsonSchemaValidator
     from haystack import component
     from haystack.dataclasses import ChatMessage
@@ -39,47 +49,56 @@ class JsonSchemaValidator:
     @component
     class MessageProducer:
 
-        @component.output_types(messages=List[ChatMessage])
-        def run(self, messages: List[ChatMessage]) -> dict:
+        @component.output_types(messages=list[ChatMessage])
+        def run(self, messages: list[ChatMessage]) -> dict:
             return {"messages": messages}
 
 
     p = Pipeline()
-    p.add_component("llm", OpenAIChatGenerator(model="gpt-4-1106-preview",
-                                               generation_kwargs={"response_format": {"type": "json_object"}}))
+    p.add_component("llm", OpenAIChatGenerator(generation_kwargs={"response_format": {"type": "json_object"}}))
     p.add_component("schema_validator", JsonSchemaValidator())
-    p.add_component("mx_for_llm", Multiplexer(List[ChatMessage]))
+    p.add_component("joiner_for_llm", BranchJoiner(list[ChatMessage]))
     p.add_component("message_producer", MessageProducer())
 
-    p.connect("message_producer.messages", "mx_for_llm")
-    p.connect("mx_for_llm", "llm")
+    p.connect("message_producer.messages", "joiner_for_llm")
+    p.connect("joiner_for_llm", "llm")
     p.connect("llm.replies", "schema_validator.messages")
-    p.connect("schema_validator.validation_error", "mx_for_llm")
+    p.connect("schema_validator.validation_error", "joiner_for_llm")
 
-    result = p.run(
-        data={"message_producer": {"messages":[ChatMessage.from_user("Generate JSON for person with name 'John' and age 30")]},
-              "schema_validator": {"json_schema": {"type": "object",
-                                                   "properties": {"name": {"type": "string"},
-                                                                  "age": {"type": "integer"}}}}})
+    result = p.run(data={
+        "message_producer": {
+            "messages":[ChatMessage.from_user("Generate JSON for person with name 'John' and age 30")]},
+            "schema_validator": {
+                "json_schema": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"},
+                    "age": {"type": "integer"}
+                }
+            }
+        }
+    })
     print(result)
-    >> {'schema_validator': {'validated': [ChatMessage(content='\\n{\\n  "name": "John",\\n  "age": 30\\n}',
-    role=<ChatRole.ASSISTANT: 'assistant'>, name=None, meta={'model': 'gpt-4-1106-preview', 'index': 0,
-    'finish_reason': 'stop', 'usage': {'completion_tokens': 17, 'prompt_tokens': 20, 'total_tokens': 37}})]}}
+    # >> {'schema_validator': {'validated': [ChatMessage(_role=<ChatRole.ASSISTANT: 'assistant'>,
+    # _content=[TextContent(text="\\n{\\n  "name": "John",\\n  "age": 30\\n}")],
+    # _name=None, _meta={'index': 0, 'finish_reason': 'stop', 'usage': {'completion_tokens': 17, 'prompt_tokens': 20,
+    # 'total_tokens': 37}})]}}
     ```
     """
 
     # Default error description template
     default_error_template = (
-        "The JSON content in the next message does not conform to the provided schema.\n"
+        "The following generated JSON does not conform to the provided schema.\n"
+        "Generated JSON: {failing_json}\n"
         "Error details:\n- Message: {error_message}\n"
         "- Error Path in JSON: {error_path}\n"
         "- Schema Path: {error_schema_path}\n"
         "Please match the following schema:\n"
         "{json_schema}\n"
-        "and provide the corrected JSON content ONLY."
+        "and provide the corrected JSON content ONLY. Please do not output anything else than the raw corrected "
+        "JSON string, this is the most important part of the task. Don't use any markdown and don't add any comment."
     )
 
-    def __init__(self, json_schema: Optional[Dict[str, Any]] = None, error_template: Optional[str] = None):
+    def __init__(self, json_schema: dict[str, Any] | None = None, error_template: str | None = None) -> None:
         """
         Initialize the JsonSchemaValidator component.
 
@@ -87,17 +106,13 @@ class JsonSchemaValidator:
             the messages' content is validated.
         :param error_template: A custom template string for formatting the error message in case of validation failure.
         """
-        jsonschema_import.check()
         self.json_schema = json_schema
         self.error_template = error_template
 
-    @component.output_types(validated=List[ChatMessage], validation_error=List[ChatMessage])
+    @component.output_types(validated=list[ChatMessage], validation_error=list[ChatMessage])
     def run(
-        self,
-        messages: List[ChatMessage],
-        json_schema: Optional[Dict[str, Any]] = None,
-        error_template: Optional[str] = None,
-    ) -> Dict[str, List[ChatMessage]]:
+        self, messages: list[ChatMessage], json_schema: dict[str, Any] | None = None, error_template: str | None = None
+    ) -> dict[str, list[ChatMessage]]:
         """
         Validates the last of the provided messages against the specified json schema.
 
@@ -118,14 +133,25 @@ class JsonSchemaValidator:
             dictionaries.
         """
         last_message = messages[-1]
-        last_message_content = json.loads(last_message.content)
+        if last_message.text is None:
+            raise ValueError(f"The provided ChatMessage has no text. ChatMessage: {last_message}")
+        if not is_valid_json(last_message.text):
+            return {
+                "validation_error": [
+                    ChatMessage.from_user(
+                        f"The message '{last_message.text}' is not a valid JSON object. "
+                        f"Please provide only a valid JSON object in string format."
+                        f"Don't use any markdown and don't add any comment."
+                    )
+                ]
+            }
 
+        last_message_content = json.loads(last_message.text)
         json_schema = json_schema or self.json_schema
         error_template = error_template or self.error_template or self.default_error_template
 
         if not json_schema:
             raise ValueError("Provide a JSON schema for validation either in the run method or in the component init.")
-
         # fc payload is json object but subtree `parameters` is string - we need to convert to json object
         # we need complete json to validate it against schema
         last_message_json = self._recursive_json_to_object(last_message_content)
@@ -142,7 +168,7 @@ class JsonSchemaValidator:
                 else:
                     validate(instance=content, schema=validation_schema)
 
-            return {"validated": messages}
+            return {"validated": [last_message]}
         except ValidationError as e:
             error_path = " -> ".join(map(str, e.absolute_path)) if e.absolute_path else "N/A"
             error_schema_path = " -> ".join(map(str, e.absolute_schema_path)) if e.absolute_schema_path else "N/A"
@@ -150,10 +176,9 @@ class JsonSchemaValidator:
             error_template = error_template or self.default_error_template
 
             recovery_prompt = self._construct_error_recovery_message(
-                error_template, str(e), error_path, error_schema_path, validation_schema
+                error_template, str(e), error_path, error_schema_path, validation_schema, failing_json=last_message.text
             )
-            complete_message_list = [ChatMessage.from_user(recovery_prompt)] + messages
-            return {"validation_error": complete_message_list}
+            return {"validation_error": [ChatMessage.from_user(recovery_prompt)]}
 
     def _construct_error_recovery_message(
         self,
@@ -161,7 +186,8 @@ class JsonSchemaValidator:
         error_message: str,
         error_path: str,
         error_schema_path: str,
-        json_schema: Dict[str, Any],
+        json_schema: dict[str, Any],
+        failing_json: str,
     ) -> str:
         """
         Constructs an error recovery message using a specified template or the default one if none is provided.
@@ -171,6 +197,7 @@ class JsonSchemaValidator:
         :param error_path: The path in the JSON content where the error occurred.
         :param error_schema_path: The path in the JSON schema where the error occurred.
         :param json_schema: The JSON schema against which the content is validated.
+        :param failing_json: The generated invalid JSON string.
         """
         error_template = error_template or self.default_error_template
 
@@ -179,9 +206,10 @@ class JsonSchemaValidator:
             error_path=error_path,
             error_schema_path=error_schema_path,
             json_schema=json_schema,
+            failing_json=failing_json,
         )
 
-    def _is_openai_function_calling_schema(self, json_schema: Dict[str, Any]) -> bool:
+    def _is_openai_function_calling_schema(self, json_schema: dict[str, Any]) -> bool:
         """
         Checks if the provided schema is a valid OpenAI function calling schema.
 
@@ -208,11 +236,10 @@ class JsonSchemaValidator:
                 if isinstance(value, str):
                     try:
                         json_value = json.loads(value)
-                        new_dict[key] = (
-                            self._recursive_json_to_object(json_value)
-                            if isinstance(json_value, (dict, list))
-                            else json_value
-                        )
+                        if isinstance(json_value, (dict, list)):
+                            new_dict[key] = self._recursive_json_to_object(json_value)
+                        else:
+                            new_dict[key] = value  # Preserve the original string value
                     except json.JSONDecodeError:
                         new_dict[key] = value
                 elif isinstance(value, dict):

@@ -5,14 +5,10 @@
 import abc
 import contextlib
 import os
-from typing import Any, Dict, Iterator, Optional
+from collections.abc import Iterator
+from typing import Any
 
-from haystack import logging
-
-HAYSTACK_AUTO_TRACE_ENABLED_ENV_VAR = "HAYSTACK_AUTO_TRACE_ENABLED"
 HAYSTACK_CONTENT_TRACING_ENABLED_ENV_VAR = "HAYSTACK_CONTENT_TRACING_ENABLED"
-
-logger = logging.getLogger(__name__)
 
 
 class Span(abc.ABC):
@@ -31,7 +27,7 @@ class Span(abc.ABC):
         """
         pass
 
-    def set_tags(self, tags: Dict[str, Any]) -> None:
+    def set_tags(self, tags: dict[str, Any]) -> None:
         """
         Set multiple tags on the span.
 
@@ -69,7 +65,7 @@ class Span(abc.ABC):
         if tracer.is_content_tracing_enabled:
             self.set_tag(key, value)
 
-    def get_correlation_data_for_logs(self) -> Dict[str, Any]:
+    def get_correlation_data_for_logs(self) -> dict[str, Any]:
         """
         Return a dictionary with correlation data for logs.
 
@@ -83,18 +79,22 @@ class Tracer(abc.ABC):
 
     @abc.abstractmethod
     @contextlib.contextmanager
-    def trace(self, operation_name: str, tags: Optional[Dict[str, Any]] = None) -> Iterator[Span]:
+    def trace(
+        self, operation_name: str, tags: dict[str, Any] | None = None, parent_span: Span | None = None
+    ) -> Iterator[Span]:
         """
         Trace the execution of a block of code.
 
         :param operation_name: the name of the operation being traced.
         :param tags: tags to apply to the newly created span.
+        :param parent_span: the parent span to use for the newly created span.
+            If `None`, the newly created span will be a root span.
         :return: the newly created span.
         """
         pass
 
     @abc.abstractmethod
-    def current_span(self) -> Optional[Span]:
+    def current_span(self) -> Span | None:
         """
         Returns the currently active span. If no span is active, returns `None`.
 
@@ -113,16 +113,19 @@ class ProxyTracer(Tracer):
     """
 
     def __init__(self, provided_tracer: Tracer) -> None:
+        """Creates an instance of ProxyTracer."""
         self.actual_tracer: Tracer = provided_tracer
         self.is_content_tracing_enabled = os.getenv(HAYSTACK_CONTENT_TRACING_ENABLED_ENV_VAR, "false").lower() == "true"
 
     @contextlib.contextmanager
-    def trace(self, operation_name: str, tags: Optional[Dict[str, Any]] = None) -> Iterator[Span]:
+    def trace(
+        self, operation_name: str, tags: dict[str, Any] | None = None, parent_span: Span | None = None
+    ) -> Iterator[Span]:
         """Activate and return a new span that inherits from the current active span."""
-        with self.actual_tracer.trace(operation_name, tags=tags) as span:
+        with self.actual_tracer.trace(operation_name, tags=tags, parent_span=parent_span) as span:
             yield span
 
-    def current_span(self) -> Optional[Span]:
+    def current_span(self) -> Span | None:
         """Return the current active span"""
         return self.actual_tracer.current_span()
 
@@ -139,11 +142,16 @@ class NullTracer(Tracer):
     """A no-op implementation of the `Tracer` interface. This is used when tracing is disabled."""
 
     @contextlib.contextmanager
-    def trace(self, operation_name: str, tags: Optional[Dict[str, Any]] = None) -> Iterator[Span]:
+    def trace(
+        self,
+        operation_name: str,  # noqa: ARG002
+        tags: dict[str, Any] | None = None,  # noqa: ARG002
+        parent_span: Span | None = None,  # noqa: ARG002
+    ) -> Iterator[Span]:
         """Activate and return a new span that inherits from the current active span."""
         yield NullSpan()
 
-    def current_span(self) -> Optional[Span]:
+    def current_span(self) -> Span | None:
         """Return the current active span"""
         return NullSpan()
 
@@ -167,65 +175,3 @@ def disable_tracing() -> None:
 def is_tracing_enabled() -> bool:
     """Return whether tracing is enabled."""
     return not isinstance(tracer.actual_tracer, NullTracer)
-
-
-def auto_enable_tracing() -> None:
-    """
-    Auto-enable the right tracing backend.
-
-    This behavior can be disabled by setting the environment variable `HAYSTACK_AUTO_TRACE_ENABLED` to `false`.
-    Note that it will only work correctly if tracing was configured _before_ Haystack is imported.
-    """
-    if os.getenv(HAYSTACK_AUTO_TRACE_ENABLED_ENV_VAR, "true").lower() == "false":
-        logger.info(
-            "Tracing disabled via environment variable '{env_key}'", env_key=HAYSTACK_AUTO_TRACE_ENABLED_ENV_VAR
-        )
-        return
-
-    if is_tracing_enabled():
-        return  # tracing already enabled
-
-    tracer = _auto_configured_opentelemetry_tracer() or _auto_configured_datadog_tracer()
-    if tracer:
-        enable_tracing(tracer)
-        logger.info("Auto-enabled tracing for '{tracer}'", tracer=tracer.__class__.__name__)
-
-
-def _auto_configured_opentelemetry_tracer() -> Optional[Tracer]:
-    # we implement this here and not in the `opentelemetry` module to avoid import warnings when OpenTelemetry is not
-    # installed
-    try:
-        import opentelemetry.trace
-
-        # the safest way to check if tracing is enabled is to try to start a span and see if it's a no-op span
-        # alternatively we could of course check `opentelemetry.trace._TRACER_PROVIDER`
-        # but that's not part of the public API and could change in the future
-        with opentelemetry.trace.get_tracer("haystack").start_as_current_span("haystack.tracing.auto_enable") as span:
-            if isinstance(span, opentelemetry.trace.NonRecordingSpan):
-                return None
-
-            from haystack.tracing.opentelemetry import OpenTelemetryTracer
-
-            return OpenTelemetryTracer(opentelemetry.trace.get_tracer("haystack"))
-    except ImportError:
-        pass
-
-    return None
-
-
-def _auto_configured_datadog_tracer() -> Optional[Tracer]:
-    # we implement this here and not in the `datadog` module to avoid import warnings when Datadog is not installed
-    try:
-        from ddtrace import tracer
-
-        from haystack.tracing.datadog import DatadogTracer
-
-        if tracer.enabled:
-            return DatadogTracer(tracer=tracer)
-    except ImportError:
-        pass
-
-    return None
-
-
-auto_enable_tracing()

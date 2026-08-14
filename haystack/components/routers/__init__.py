@@ -2,16 +2,26 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from haystack.components.routers.conditional_router import ConditionalRouter
-from haystack.components.routers.file_type_router import FileTypeRouter
-from haystack.components.routers.metadata_router import MetadataRouter
-from haystack.components.routers.text_language_router import TextLanguageRouter
-from haystack.components.routers.zero_shot_text_router import TransformersZeroShotTextRouter
+import sys
+from typing import TYPE_CHECKING
 
-__all__ = [
-    "FileTypeRouter",
-    "MetadataRouter",
-    "TextLanguageRouter",
-    "ConditionalRouter",
-    "TransformersZeroShotTextRouter",
-]
+from lazy_imports import LazyImporter
+
+_import_structure = {
+    "conditional_router": ["ConditionalRouter"],
+    "document_length_router": ["DocumentLengthRouter"],
+    "document_type_router": ["DocumentTypeRouter"],
+    "file_type_router": ["FileTypeRouter"],
+    "llm_messages_router": ["LLMMessagesRouter"],
+    "metadata_router": ["MetadataRouter"],
+}
+
+if TYPE_CHECKING:
+    from .conditional_router import ConditionalRouter as ConditionalRouter
+    from .document_length_router import DocumentLengthRouter as DocumentLengthRouter
+    from .document_type_router import DocumentTypeRouter as DocumentTypeRouter
+    from .file_type_router import FileTypeRouter as FileTypeRouter
+    from .llm_messages_router import LLMMessagesRouter as LLMMessagesRouter
+    from .metadata_router import MetadataRouter as MetadataRouter
+else:
+    sys.modules[__name__] = LazyImporter(name=__name__, module_file=__file__, import_structure=_import_structure)

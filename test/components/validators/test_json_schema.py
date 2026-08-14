@@ -1,25 +1,24 @@
 # SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
 #
 # SPDX-License-Identifier: Apache-2.0
-import json
-from typing import List
 
-from haystack import component, Pipeline
-from haystack.components.validators import JsonSchemaValidator
+import json
 
 import pytest
 
+from haystack import Pipeline, component
+from haystack.components.validators import JsonSchemaValidator
 from haystack.dataclasses import ChatMessage
 
 
 @pytest.fixture
 def genuine_fc_message():
-    return """[{"id": "call_NJr1NBz2Th7iUWJpRIJZoJIA", "function": {"arguments": "{\\n    \\"basehead\\": \\"main...amzn_chat\\",\\n    \\"owner\\": \\"deepset-ai\\",\\n    \\"repo\\": \\"haystack-core-integrations\\"\\n  }", "name": "compare_branches"}, "type": "function"}]"""
+    return """[{"id": "call_NJr1NBz2Th7iUWJpRIJZoJIA", "function": {"arguments": "{\\n    \\"basehead\\": \\"main...amzn_chat\\",\\n    \\"owner\\": \\"deepset-ai\\",\\n    \\"repo\\": \\"haystack-core-integrations\\"\\n  }", "name": "compare_branches"}, "type": "function"}]"""  # noqa: E501
 
 
 @pytest.fixture
 def json_schema_github_compare():
-    json_schema = {
+    return {
         "type": "object",
         "properties": {
             "id": {"type": "string", "description": "A unique identifier for the call"},
@@ -50,12 +49,11 @@ def json_schema_github_compare():
         "required": ["function", "type"],
         "description": "Structure representing a function call",
     }
-    return json_schema
 
 
 @pytest.fixture
 def json_schema_github_compare_openai():
-    json_schema = {
+    return {
         "name": "compare_branches",
         "description": "Compares two branches in a GitHub repository",
         "parameters": {
@@ -73,7 +71,6 @@ def json_schema_github_compare_openai():
             "description": "Parameters for the function call",
         },
     }
-    return json_schema
 
 
 class TestJsonSchemaValidator:
@@ -110,10 +107,9 @@ class TestJsonSchemaValidator:
         ]
 
         result = validator.run(messages, json_schema_github_compare)
-
         assert "validated" in result
-        assert len(result["validated"]) == 2
-        assert result["validated"] == messages
+        assert len(result["validated"]) == 1
+        assert result["validated"][0] == messages[1]
 
     #  Validates a message against an OpenAI function calling schema successfully.
     def test_validates_message_against_openai_function_calling_schema(
@@ -142,8 +138,8 @@ class TestJsonSchemaValidator:
         result = validator.run(messages, json_schema_github_compare_openai)
 
         assert "validated" in result
-        assert len(result["validated"]) == 2
-        assert result["validated"] == messages
+        assert len(result["validated"]) == 1
+        assert result["validated"][0] == messages[1]
 
     #  Constructs a custom error recovery message when validation fails.
     def test_construct_custom_error_recovery_message(self):
@@ -155,10 +151,11 @@ class TestJsonSchemaValidator:
             "- Schema Path: {error_schema_path}\n"
             "Please match the following schema:\n"
             "{json_schema}\n"
+            "Failing Json: {failing_json}\n"
         )
 
         recovery_message = validator._construct_error_recovery_message(
-            new_error_template, "Error message", "Error path", "Error schema path", {"type": "object"}
+            new_error_template, "Error message", "Error path", "Error schema path", {"type": "object"}, "Failing Json"
         )
 
         expected_recovery_message = (
@@ -167,13 +164,14 @@ class TestJsonSchemaValidator:
             "- Schema Path: Error schema path\n"
             "Please match the following schema:\n"
             "{'type': 'object'}\n"
+            "Failing Json: Failing Json\n"
         )
         assert recovery_message == expected_recovery_message
 
     def test_schema_validator_in_pipeline_validated(self, json_schema_github_compare, genuine_fc_message):
         @component
         class ChatMessageProducer:
-            @component.output_types(messages=List[ChatMessage])
+            @component.output_types(messages=list[ChatMessage])
             def run(self):
                 return {"messages": [ChatMessage.from_assistant(genuine_fc_message)]}
 
@@ -184,12 +182,12 @@ class TestJsonSchemaValidator:
         result = pipe.run(data={"schema_validator": {"json_schema": json_schema_github_compare}})
         assert "validated" in result["schema_validator"]
         assert len(result["schema_validator"]["validated"]) == 1
-        assert result["schema_validator"]["validated"][0].content == genuine_fc_message
+        assert result["schema_validator"]["validated"][0].text == genuine_fc_message
 
     def test_schema_validator_in_pipeline_validation_error(self, json_schema_github_compare):
         @component
         class ChatMessageProducer:
-            @component.output_types(messages=List[ChatMessage])
+            @component.output_types(messages=list[ChatMessage])
             def run(self):
                 # example json string that is not valid
                 simple_invalid_json = '{"key": "value"}'
@@ -201,5 +199,5 @@ class TestJsonSchemaValidator:
         pipe.connect("message_producer", "schema_validator")
         result = pipe.run(data={"schema_validator": {"json_schema": json_schema_github_compare}})
         assert "validation_error" in result["schema_validator"]
-        assert len(result["schema_validator"]["validation_error"]) > 1
-        assert "Error details" in result["schema_validator"]["validation_error"][0].content
+        assert len(result["schema_validator"]["validation_error"]) == 1
+        assert "Error details" in result["schema_validator"]["validation_error"][0].text

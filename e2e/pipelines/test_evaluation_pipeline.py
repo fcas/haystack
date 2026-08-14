@@ -3,13 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-from typing import List
 
 import pytest
 
 from haystack import Document, Pipeline
-from haystack.components.builders import AnswerBuilder, PromptBuilder
-from haystack.components.embedders import SentenceTransformersDocumentEmbedder, SentenceTransformersTextEmbedder
+from haystack.components.builders import AnswerBuilder, ChatPromptBuilder
+from haystack.components.embedders import OpenAIDocumentEmbedder, OpenAITextEmbedder
 from haystack.components.evaluators import (
     ContextRelevanceEvaluator,
     DocumentMAPEvaluator,
@@ -19,53 +18,55 @@ from haystack.components.evaluators import (
     SASEvaluator,
 )
 from haystack.components.evaluators.document_recall import RecallMode
-from haystack.components.generators import OpenAIGenerator
+from haystack.components.generators.chat import OpenAIChatGenerator
 from haystack.components.retrievers import InMemoryEmbeddingRetriever
 from haystack.components.writers import DocumentWriter
 from haystack.document_stores.in_memory import InMemoryDocumentStore
 from haystack.document_stores.types import DuplicatePolicy
 from haystack.evaluation import EvaluationRunResult
+from haystack.dataclasses import ChatMessage
 
-EMBEDDINGS_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDINGS_MODEL = "text-embedding-3-small"
 
 
-def indexing_pipeline(documents: List[Document]):
+def indexing_pipeline(documents: list[Document]):
     """Indexing the documents"""
     document_store = InMemoryDocumentStore()
     doc_writer = DocumentWriter(document_store=document_store, policy=DuplicatePolicy.SKIP)
-    doc_embedder = SentenceTransformersDocumentEmbedder(model=EMBEDDINGS_MODEL, progress_bar=False)
+    doc_embedder = OpenAIDocumentEmbedder(model=EMBEDDINGS_MODEL, progress_bar=False)
     ingestion_pipe = Pipeline()
-    ingestion_pipe.add_component(instance=doc_embedder, name="doc_embedder")  # type: ignore
-    ingestion_pipe.add_component(instance=doc_writer, name="doc_writer")  # type: ignore
+    ingestion_pipe.add_component(instance=doc_embedder, name="doc_embedder")
+    ingestion_pipe.add_component(instance=doc_writer, name="doc_writer")
     ingestion_pipe.connect("doc_embedder.documents", "doc_writer.documents")
     ingestion_pipe.run({"doc_embedder": {"documents": documents}})
     return document_store
 
 
-def rag_pipeline(document_store: InMemoryDocumentStore, top_k: int):  # type: ignore
+def rag_pipeline(document_store: InMemoryDocumentStore, top_k: int):
     """RAG pipeline"""
-    template = """
-        You have to answer the following question based on the given context information only.
+    template = [
+        ChatMessage.from_system(
+            text="You have to answer the following question based on the given context information only."
+        ),
+        ChatMessage.from_user(
+            text="""Context:
+            {% for document in documents %}
+                {{ document.content }}
+            {% endfor %}
 
-        Context:
-        {% for document in documents %}
-            {{ document.content }}
-        {% endfor %}
-
-        Question: {{question}}
-        Answer:
-        """
+            Question: {{question}}"""
+        ),
+    ]
     rag = Pipeline()
-    rag.add_component("embedder", SentenceTransformersTextEmbedder(model=EMBEDDINGS_MODEL, progress_bar=False))  # type: ignore
-    rag.add_component("retriever", InMemoryEmbeddingRetriever(document_store, top_k=top_k))  # type: ignore
-    rag.add_component("prompt_builder", PromptBuilder(template=template))  # type: ignore
-    rag.add_component("generator", OpenAIGenerator(model="gpt-3.5-turbo"))  # type: ignore
-    rag.add_component("answer_builder", AnswerBuilder())  # type: ignore
+    rag.add_component("embedder", OpenAITextEmbedder(model=EMBEDDINGS_MODEL))
+    rag.add_component("retriever", InMemoryEmbeddingRetriever(document_store, top_k=top_k))
+    rag.add_component("prompt_builder", ChatPromptBuilder(template=template))
+    rag.add_component("generator", OpenAIChatGenerator(model="gpt-4o-mini"))
+    rag.add_component("answer_builder", AnswerBuilder())
     rag.connect("embedder", "retriever.query_embedding")
     rag.connect("retriever", "prompt_builder.documents")
     rag.connect("prompt_builder", "generator")
     rag.connect("generator.replies", "answer_builder.replies")
-    rag.connect("generator.meta", "answer_builder.meta")
     rag.connect("retriever", "answer_builder.documents")
 
     return rag
@@ -85,7 +86,7 @@ def evaluation_pipeline():
     eval_pipeline = Pipeline()
     eval_pipeline.add_component("doc_mrr", DocumentMRREvaluator())
     eval_pipeline.add_component("groundedness", FaithfulnessEvaluator())
-    eval_pipeline.add_component("sas", SASEvaluator(model=EMBEDDINGS_MODEL))
+    eval_pipeline.add_component("sas", SASEvaluator())
     eval_pipeline.add_component("doc_map", DocumentMAPEvaluator())
     eval_pipeline.add_component("doc_recall_single_hit", DocumentRecallEvaluator(mode=RecallMode.SINGLE_HIT))
     eval_pipeline.add_component("doc_recall_multi_hit", DocumentRecallEvaluator(mode=RecallMode.MULTI_HIT))
@@ -200,7 +201,8 @@ def test_evaluation_pipeline(samples_path):
     for article in os.listdir(full_path):
         with open(f"{full_path}/{article}", "r") as f:
             for text in f.read().split("\n"):
-                docs.append(Document(content=text, meta={"name": article})) if text else None
+                if doc := Document(content=text, meta={"name": article}) if text else None:
+                    docs.append(doc)
     doc_store = indexing_pipeline(docs)
 
     # running the RAG pipeline A + evaluation pipeline
@@ -219,12 +221,12 @@ def test_evaluation_pipeline(samples_path):
     }
     results_a = built_input_for_results_eval(results_rag_a)
     evaluation_result_a = EvaluationRunResult(run_name="rag_pipeline_a", results=results_a, inputs=inputs_a)
-    df_score_report = evaluation_result_a.score_report()
+    aggregated_score_report_json = evaluation_result_a.aggregated_report()
 
     # assert the score report has all the metrics
-    assert len(df_score_report) == 7
-    assert list(df_score_report.columns) == ["score"]
-    assert list(df_score_report.index) == [
+    assert len(aggregated_score_report_json["metrics"]) == 7
+    assert list(aggregated_score_report_json.keys()) == ["metrics", "score"]
+    assert list(aggregated_score_report_json["metrics"]) == [
         "Mean Reciprocal Rank",
         "Semantic Answer Similarity",
         "Faithfulness",
@@ -235,8 +237,8 @@ def test_evaluation_pipeline(samples_path):
     ]
 
     # assert the evaluation result has all the metrics, inputs and questions
-    df = evaluation_result_a.to_pandas()
-    assert list(df.columns) == [
+    detailed_report_json = evaluation_result_a.detailed_report()
+    assert list(detailed_report_json.keys()) == [
         "question",
         "contexts",
         "answer",
@@ -249,7 +251,6 @@ def test_evaluation_pipeline(samples_path):
         "Document Recall Multi Hit",
         "Contextual Relevance",
     ]
-    assert len(df) == 3
 
     # running the RAG pipeline B
     rag_pipeline_b = rag_pipeline(doc_store, top_k=4)
@@ -265,11 +266,10 @@ def test_evaluation_pipeline(samples_path):
     }
     results_b = built_input_for_results_eval(results_rag_b)
     evaluation_result_b = EvaluationRunResult(run_name="rag_pipeline_b", results=results_b, inputs=inputs_b)
-    df_comparative = evaluation_result_a.comparative_individual_scores_report(evaluation_result_b)
+    comparative_json = evaluation_result_a.comparative_detailed_report(evaluation_result_b)
 
     # assert the comparative score report has all the metrics, inputs and questions
-    assert len(df_comparative) == 3
-    assert list(df_comparative.columns) == [
+    assert list(comparative_json.keys()) == [
         "question",
         "contexts",
         "answer",

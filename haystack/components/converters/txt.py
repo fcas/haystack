@@ -2,8 +2,9 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 from haystack import Document, component, logging
 from haystack.components.converters.utils import get_bytestream_from_source, normalize_metadata
@@ -15,58 +16,66 @@ logger = logging.getLogger(__name__)
 @component
 class TextFileToDocument:
     """
-    Converts text files to Documents.
+    Converts text files to documents your pipeline can query.
 
-    Usage example:
+    By default, it uses UTF-8 encoding when converting files but
+    you can also set custom encoding.
+    It can attach metadata to the resulting documents.
+
+    ### Usage example
+
     ```python
     from haystack.components.converters.txt import TextFileToDocument
 
     converter = TextFileToDocument()
-    results = converter.run(sources=["sample.txt"])
+    results = converter.run(sources=["test/test_files/txt/doc_1.txt"])
     documents = results["documents"]
+
     print(documents[0].content)
-    # 'This is the content from the txt file.'
+    # >> 'This is the content from the txt file.'
     ```
     """
 
-    def __init__(self, encoding: str = "utf-8"):
+    def __init__(self, encoding: str = "utf-8", store_full_path: bool = False) -> None:
         """
-        Create a TextFileToDocument component.
+        Creates a TextFileToDocument component.
 
         :param encoding:
-            The encoding of the text files.
-            Note that if the encoding is specified in the metadata of a source ByteStream,
-            it will override this value.
+            The encoding of the text files to convert.
+            If the encoding is specified in the metadata of a source ByteStream,
+            it overrides this value.
+        :param store_full_path:
+            If True, the full path of the file is stored in the metadata of the document.
+            If False, only the file name is stored.
         """
         self.encoding = encoding
+        self.store_full_path = store_full_path
 
-    @component.output_types(documents=List[Document])
+    @component.output_types(documents=list[Document])
     def run(
-        self,
-        sources: List[Union[str, Path, ByteStream]],
-        meta: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None,
-    ):
+        self, sources: list[str | Path | ByteStream], meta: dict[str, Any] | list[dict[str, Any]] | None = None
+    ) -> dict[str, list[Document]]:
         """
-        Converts text files to Documents.
+        Converts text files to documents.
 
         :param sources:
-            List of HTML file paths or ByteStream objects.
+            List of text file paths or ByteStream objects to convert.
         :param meta:
-            Optional metadata to attach to the Documents.
-            This value can be either a list of dictionaries or a single dictionary.
-            If it's a single dictionary, its content is added to the metadata of all produced Documents.
-            If it's a list, the length of the list must match the number of sources, because the two lists will be zipped.
-            If `sources` contains ByteStream objects, their `meta` will be added to the output Documents.
+            Optional metadata to attach to the documents.
+            This value can be a list of dictionaries or a single dictionary.
+            If it's a single dictionary, its content is added to the metadata of all produced documents.
+            If it's a list, its length must match the number of sources as they're zipped together.
+            For ByteStream objects, their `meta` is added to the output documents.
 
         :returns:
             A dictionary with the following keys:
-            - `documents`: Created Documents
+            - `documents`: A list of converted documents.
         """
         documents = []
 
         meta_list = normalize_metadata(meta, sources_count=len(sources))
 
-        for source, metadata in zip(sources, meta_list):
+        for source, metadata in zip(sources, meta_list, strict=True):
             try:
                 bytestream = get_bytestream_from_source(source)
             except Exception as e:
@@ -82,6 +91,9 @@ class TextFileToDocument:
                 continue
 
             merged_metadata = {**bytestream.meta, **metadata}
+
+            if not self.store_full_path and (file_path := bytestream.meta.get("file_path")):
+                merged_metadata["file_path"] = os.path.basename(file_path)
             document = Document(content=text, meta=merged_metadata)
             documents.append(document)
 

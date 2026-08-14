@@ -2,14 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import io
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Optional, Protocol, runtime_checkable
 
-from pandas import DataFrame, read_json
-
-from haystack.core.serialization import default_from_dict, default_to_dict
-from haystack.dataclasses.document import Document
+from haystack.dataclasses import ChatMessage, Document
+from haystack.utils.dataclasses import _warn_on_inplace_mutation
 
 
 @runtime_checkable
@@ -17,160 +14,128 @@ from haystack.dataclasses.document import Document
 class Answer(Protocol):
     data: Any
     query: str
-    meta: Dict[str, Any]
+    meta: dict[str, Any]
 
-    def to_dict(self) -> Dict[str, Any]:  # noqa: D102
+    def to_dict(self) -> dict[str, Any]:  # noqa: D102
         ...
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Answer":  # noqa: D102
+    def from_dict(cls, data: dict[str, Any]) -> "Answer":  # noqa: D102
         ...
 
 
+@_warn_on_inplace_mutation
 @dataclass
 class ExtractedAnswer:
+    """
+    Holds an answer extracted by an extractive Reader (query, score, text, and optional document/context).
+    """
+
     query: str
     score: float
-    data: Optional[str] = None
-    document: Optional[Document] = None
-    context: Optional[str] = None
+    data: str | None = None
+    document: Document | None = None
+    context: str | None = None
     document_offset: Optional["Span"] = None
     context_offset: Optional["Span"] = None
-    meta: Dict[str, Any] = field(default_factory=dict)
+    meta: dict[str, Any] = field(default_factory=dict)
 
+    @_warn_on_inplace_mutation
     @dataclass
     class Span:
         start: int
         end: int
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """
         Serialize the object to a dictionary.
 
         :returns:
             Serialized dictionary representation of the object.
         """
-        document = self.document.to_dict(flatten=False) if self.document is not None else None
-        document_offset = asdict(self.document_offset) if self.document_offset is not None else None
-        context_offset = asdict(self.context_offset) if self.context_offset is not None else None
-        return default_to_dict(
-            self,
-            data=self.data,
-            query=self.query,
+        return {
+            "data": self.data,
+            "query": self.query,
+            "document": self.document.to_dict(flatten=False) if self.document is not None else None,
+            "context": self.context,
+            "score": self.score,
+            "document_offset": asdict(self.document_offset) if self.document_offset is not None else None,
+            "context_offset": asdict(self.context_offset) if self.context_offset is not None else None,
+            "meta": self.meta,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ExtractedAnswer":
+        """
+        Deserialize the object from a dictionary.
+
+        :param data:
+            Dictionary representation of the object.
+        :returns:
+            Deserialized object.
+        """
+        # Backward compatibility: the old format wrapped the fields in an `init_parameters` envelope.
+        if "init_parameters" in data:
+            data = data["init_parameters"]
+
+        document = data.get("document")
+        if document is not None:
+            document = Document.from_dict(document)
+
+        document_offset = data.get("document_offset")
+        if document_offset is not None:
+            document_offset = ExtractedAnswer.Span(**document_offset)
+
+        context_offset = data.get("context_offset")
+        if context_offset is not None:
+            context_offset = ExtractedAnswer.Span(**context_offset)
+
+        return cls(
+            data=data.get("data"),
+            query=data["query"],
+            score=data["score"],
             document=document,
-            context=self.context,
-            score=self.score,
+            context=data.get("context"),
             document_offset=document_offset,
             context_offset=context_offset,
-            meta=self.meta,
+            meta=data.get("meta", {}),
         )
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ExtractedAnswer":
-        """
-        Deserialize the object from a dictionary.
 
-        :param data:
-            Dictionary representation of the object.
-        :returns:
-            Deserialized object.
-        """
-        init_params = data.get("init_parameters", {})
-        if (doc := init_params.get("document")) is not None:
-            data["init_parameters"]["document"] = Document.from_dict(doc)
-
-        if (offset := init_params.get("document_offset")) is not None:
-            data["init_parameters"]["document_offset"] = ExtractedAnswer.Span(**offset)
-
-        if (offset := init_params.get("context_offset")) is not None:
-            data["init_parameters"]["context_offset"] = ExtractedAnswer.Span(**offset)
-        return default_from_dict(cls, data)
-
-
-@dataclass
-class ExtractedTableAnswer:
-    query: str
-    score: float
-    data: Optional[str] = None
-    document: Optional[Document] = None
-    context: Optional[DataFrame] = None
-    document_cells: List["Cell"] = field(default_factory=list)
-    context_cells: List["Cell"] = field(default_factory=list)
-    meta: Dict[str, Any] = field(default_factory=dict)
-
-    @dataclass
-    class Cell:
-        row: int
-        column: int
-
-    def to_dict(self) -> Dict[str, Any]:
-        """
-        Serialize the object to a dictionary.
-
-        :returns:
-            Serialized dictionary representation of the object.
-        """
-        document = self.document.to_dict(flatten=False) if self.document is not None else None
-        context = self.context.to_json() if self.context is not None else None
-        document_cells = [asdict(c) for c in self.document_cells]
-        context_cells = [asdict(c) for c in self.context_cells]
-        return default_to_dict(
-            self,
-            data=self.data,
-            query=self.query,
-            document=document,
-            context=context,
-            score=self.score,
-            document_cells=document_cells,
-            context_cells=context_cells,
-            meta=self.meta,
-        )
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ExtractedTableAnswer":
-        """
-        Deserialize the object from a dictionary.
-
-        :param data:
-            Dictionary representation of the object.
-
-        :returns:
-            Deserialized object.
-        """
-        init_params = data.get("init_parameters", {})
-        if (doc := init_params.get("document")) is not None:
-            data["init_parameters"]["document"] = Document.from_dict(doc)
-
-        if (context := init_params.get("context")) is not None:
-            data["init_parameters"]["context"] = read_json(io.StringIO(context))
-
-        if (cells := init_params.get("document_cells")) is not None:
-            data["init_parameters"]["document_cells"] = [ExtractedTableAnswer.Cell(**c) for c in cells]
-
-        if (cells := init_params.get("context_cells")) is not None:
-            data["init_parameters"]["context_cells"] = [ExtractedTableAnswer.Cell(**c) for c in cells]
-        return default_from_dict(cls, data)
-
-
+@_warn_on_inplace_mutation
 @dataclass
 class GeneratedAnswer:
+    """
+    Holds a generated answer from a Generator (answer text, query, referenced documents, and metadata).
+    """
+
     data: str
     query: str
-    documents: List[Document]
-    meta: Dict[str, Any] = field(default_factory=dict)
+    documents: list[Document]
+    meta: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """
         Serialize the object to a dictionary.
 
         :returns:
             Serialized dictionary representation of the object.
         """
-        documents = [doc.to_dict(flatten=False) for doc in self.documents]
-        return default_to_dict(self, data=self.data, query=self.query, documents=documents, meta=self.meta)
+        # all_messages is either a list of ChatMessage objects or a list of strings
+        meta = self.meta
+        all_messages = meta.get("all_messages")
+        if all_messages and isinstance(all_messages[0], ChatMessage):
+            meta = {**meta, "all_messages": [msg.to_dict() for msg in all_messages]}
+
+        return {
+            "data": self.data,
+            "query": self.query,
+            "documents": [doc.to_dict(flatten=False) for doc in self.documents],
+            "meta": meta,
+        }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "GeneratedAnswer":
+    def from_dict(cls, data: dict[str, Any]) -> "GeneratedAnswer":
         """
         Deserialize the object from a dictionary.
 
@@ -180,8 +145,15 @@ class GeneratedAnswer:
         :returns:
             Deserialized object.
         """
-        init_params = data.get("init_parameters", {})
-        if (documents := init_params.get("documents")) is not None:
-            data["init_parameters"]["documents"] = [Document.from_dict(d) for d in documents]
+        # Backward compatibility: the old format wrapped the fields in an `init_parameters` envelope.
+        if "init_parameters" in data:
+            data = data["init_parameters"]
 
-        return default_from_dict(cls, data)
+        documents = [Document.from_dict(d) for d in data.get("documents", [])]
+
+        # Copy `meta` before converting `all_messages` so the caller's input dict is left untouched.
+        meta = dict(data.get("meta", {}))
+        if (all_messages := meta.get("all_messages")) and isinstance(all_messages[0], dict):
+            meta["all_messages"] = [ChatMessage.from_dict(m) for m in all_messages]
+
+        return cls(data=data["data"], query=data["query"], documents=documents, meta=meta)

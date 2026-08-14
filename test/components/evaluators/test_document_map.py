@@ -1,10 +1,80 @@
 # SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
 #
 # SPDX-License-Identifier: Apache-2.0
+
 import pytest
 
-from haystack import Document
+from haystack import Document, default_from_dict
 from haystack.components.evaluators.document_map import DocumentMAPEvaluator
+
+
+def test_to_dict():
+    evaluator = DocumentMAPEvaluator()
+    data = evaluator.to_dict()
+    assert data == {
+        "type": "haystack.components.evaluators.document_map.DocumentMAPEvaluator",
+        "init_parameters": {"document_comparison_field": "content"},
+    }
+
+
+def test_from_dict():
+    data = {
+        "type": "haystack.components.evaluators.document_map.DocumentMAPEvaluator",
+        "init_parameters": {"document_comparison_field": "id"},
+    }
+    evaluator = default_from_dict(DocumentMAPEvaluator, data)
+    assert evaluator.document_comparison_field == "id"
+
+
+def test_run_with_id_comparison():
+    evaluator = DocumentMAPEvaluator(document_comparison_field="id")
+    result = evaluator.run(
+        ground_truth_documents=[[Document(id="doc1", content="foo")], [Document(id="doc2", content="bar")]],
+        retrieved_documents=[[Document(id="doc1", content="different")], [Document(id="wrong", content="bar")]],
+    )
+    assert result == {"individual_scores": [1.0, 0.0], "score": 0.5}
+
+
+def test_run_with_meta_comparison():
+    evaluator = DocumentMAPEvaluator(document_comparison_field="meta.file_id")
+    result = evaluator.run(
+        ground_truth_documents=[
+            [Document(content="x", meta={"file_id": "a"})],
+            [Document(content="y", meta={"file_id": "b"})],
+        ],
+        retrieved_documents=[
+            [Document(content="z", meta={"file_id": "a"})],
+            [Document(content="w", meta={"file_id": "c"})],
+        ],
+    )
+    assert result == {"individual_scores": [1.0, 0.0], "score": 0.5}
+
+
+def test_run_with_nested_meta_comparison():
+    evaluator = DocumentMAPEvaluator(document_comparison_field="meta.source.url")
+    result = evaluator.run(
+        ground_truth_documents=[
+            [Document(content="x", meta={"source": {"url": "https://a.com"}})],
+            [Document(content="y", meta={"source": {"url": "https://b.com"}})],
+        ],
+        retrieved_documents=[
+            [Document(content="z", meta={"source": {"url": "https://a.com"}})],
+            [Document(content="w", meta={"source": {"url": "https://c.com"}})],
+        ],
+    )
+    assert result == {"individual_scores": [1.0, 0.0], "score": 0.5}
+
+
+def test_run_with_unhashable_meta_comparison():
+    evaluator = DocumentMAPEvaluator(document_comparison_field="meta.tags")
+    result = evaluator.run(
+        ground_truth_documents=[
+            [Document(content="x", meta={"tags": ["a"]}), Document(content="y", meta={"tags": ["b"]})]
+        ],
+        retrieved_documents=[[Document(content="z", meta={"tags": ["a"]})]],
+    )
+
+    assert result == {"individual_scores": [0.5], "score": 0.5}
 
 
 def test_run_with_all_matching():
@@ -37,6 +107,19 @@ def test_run_with_partial_matching():
     assert result == {"individual_scores": [1.0, 0.0], "score": 0.5}
 
 
+@pytest.mark.parametrize(
+    "retrieved_documents", [[Document(content="A")], [Document(content="A"), Document(content="A")]]
+)
+def test_run_with_missed_and_duplicate_relevant_documents(retrieved_documents):
+    evaluator = DocumentMAPEvaluator()
+    result = evaluator.run(
+        ground_truth_documents=[[Document(content="A"), Document(content="B")]],
+        retrieved_documents=[retrieved_documents],
+    )
+
+    assert result == {"individual_scores": [0.5], "score": 0.5}
+
+
 def test_run_with_complex_data():
     evaluator = DocumentMAPEvaluator()
     result = evaluator.run(
@@ -62,7 +145,17 @@ def test_run_with_complex_data():
             ],
         ],
     )
-    assert result == {"individual_scores": [1.0, 0.8333333333333333, 1.0, 0.5, 0.0, 1.0], "score": 0.7222222222222222}
+    assert result == {
+        "individual_scores": [
+            1.0,
+            pytest.approx(0.8333333333333333),
+            0.5,  # Only one of two relevant documents was retrieved.
+            pytest.approx(0.5833333333333333),
+            0.0,
+            pytest.approx(0.8333333333333333),  # The duplicate retrieval is not credited again.
+        ],
+        "score": pytest.approx(0.625),
+    }
 
 
 def test_run_with_different_lengths():

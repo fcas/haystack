@@ -2,26 +2,27 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from haystack.components.embedders.azure_document_embedder import AzureOpenAIDocumentEmbedder
-from haystack.components.embedders.azure_text_embedder import AzureOpenAITextEmbedder
-from haystack.components.embedders.hugging_face_api_document_embedder import HuggingFaceAPIDocumentEmbedder
-from haystack.components.embedders.hugging_face_api_text_embedder import HuggingFaceAPITextEmbedder
-from haystack.components.embedders.hugging_face_tei_document_embedder import HuggingFaceTEIDocumentEmbedder
-from haystack.components.embedders.hugging_face_tei_text_embedder import HuggingFaceTEITextEmbedder
-from haystack.components.embedders.openai_document_embedder import OpenAIDocumentEmbedder
-from haystack.components.embedders.openai_text_embedder import OpenAITextEmbedder
-from haystack.components.embedders.sentence_transformers_document_embedder import SentenceTransformersDocumentEmbedder
-from haystack.components.embedders.sentence_transformers_text_embedder import SentenceTransformersTextEmbedder
+import sys
+from typing import TYPE_CHECKING
 
-__all__ = [
-    "HuggingFaceTEITextEmbedder",
-    "HuggingFaceTEIDocumentEmbedder",
-    "HuggingFaceAPITextEmbedder",
-    "HuggingFaceAPIDocumentEmbedder",
-    "SentenceTransformersTextEmbedder",
-    "SentenceTransformersDocumentEmbedder",
-    "OpenAITextEmbedder",
-    "OpenAIDocumentEmbedder",
-    "AzureOpenAITextEmbedder",
-    "AzureOpenAIDocumentEmbedder",
-]
+from lazy_imports import LazyImporter
+
+_import_structure = {
+    "azure_document_embedder": ["AzureOpenAIDocumentEmbedder"],
+    "azure_text_embedder": ["AzureOpenAITextEmbedder"],
+    "mock_document_embedder": ["MockDocumentEmbedder"],
+    "mock_text_embedder": ["MockTextEmbedder"],
+    "openai_document_embedder": ["OpenAIDocumentEmbedder"],
+    "openai_text_embedder": ["OpenAITextEmbedder"],
+}
+
+if TYPE_CHECKING:
+    from .azure_document_embedder import AzureOpenAIDocumentEmbedder as AzureOpenAIDocumentEmbedder
+    from .azure_text_embedder import AzureOpenAITextEmbedder as AzureOpenAITextEmbedder
+    from .mock_document_embedder import MockDocumentEmbedder as MockDocumentEmbedder
+    from .mock_text_embedder import MockTextEmbedder as MockTextEmbedder
+    from .openai_document_embedder import OpenAIDocumentEmbedder as OpenAIDocumentEmbedder
+    from .openai_text_embedder import OpenAITextEmbedder as OpenAITextEmbedder
+
+else:
+    sys.modules[__name__] = LazyImporter(name=__name__, module_file=__file__, import_structure=_import_structure)

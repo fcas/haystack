@@ -2,18 +2,22 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from haystack import DeserializationError, Document, component, default_from_dict, default_to_dict
+from haystack import Document, component, default_from_dict, default_to_dict
 from haystack.document_stores.in_memory import InMemoryDocumentStore
+from haystack.document_stores.types import FilterPolicy, apply_filter_policy
 
 
 @component
 class InMemoryBM25Retriever:
     """
-    Retrieves documents using the BM25 algorithm.
+    Retrieves documents that are most similar to the query using keyword-based algorithm.
 
-    Usage example:
+    Use this retriever with the InMemoryDocumentStore.
+
+    ### Usage example
+
     ```python
     from haystack import Document
     from haystack.components.retrievers.in_memory import InMemoryBM25Retriever
@@ -37,27 +41,34 @@ class InMemoryBM25Retriever:
     def __init__(
         self,
         document_store: InMemoryDocumentStore,
-        filters: Optional[Dict[str, Any]] = None,
+        filters: dict[str, Any] | None = None,
         top_k: int = 10,
         scale_score: bool = False,
-    ):
+        filter_policy: FilterPolicy = FilterPolicy.REPLACE,
+    ) -> None:
         """
         Create the InMemoryBM25Retriever component.
 
         :param document_store:
-            An instance of InMemoryDocumentStore.
+            An instance of InMemoryDocumentStore where the retriever should search for relevant documents.
         :param filters:
-            A dictionary with filters to narrow down the search space.
+            A dictionary with filters to narrow down the retriever's search space in the document store.
         :param top_k:
             The maximum number of documents to retrieve.
         :param scale_score:
-            Scales the BM25 score to a unit interval in the range of 0 to 1, where 1 means extremely relevant. If set to `False`, uses raw similarity scores.
-
+            When `True`, scales the score of retrieved documents to a range of 0 to 1, where 1 means extremely relevant.
+            When `False`, uses raw similarity scores.
+        :param filter_policy: The filter policy to apply during retrieval.
+        Filter policy determines how filters are applied when retrieving documents. You can choose:
+        - `REPLACE` (default): Overrides the initialization filters with the filters specified at runtime.
+        Use this policy to dynamically change filtering for specific queries.
+        - `MERGE`: Combines runtime filters with initialization filters to narrow down the search.
+        :raises TypeError: If the document_store is not an instance of InMemoryDocumentStore.
         :raises ValueError:
             If the specified `top_k` is not > 0.
         """
         if not isinstance(document_store, InMemoryDocumentStore):
-            raise ValueError("document_store must be an instance of InMemoryDocumentStore")
+            raise TypeError("document_store must be an instance of InMemoryDocumentStore")
 
         self.document_store = document_store
 
@@ -67,27 +78,32 @@ class InMemoryBM25Retriever:
         self.filters = filters
         self.top_k = top_k
         self.scale_score = scale_score
+        self.filter_policy = filter_policy
 
-    def _get_telemetry_data(self) -> Dict[str, Any]:
+    def _get_telemetry_data(self) -> dict[str, Any]:
         """
         Data that is sent to Posthog for usage analytics.
         """
         return {"document_store": type(self.document_store).__name__}
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """
         Serializes the component to a dictionary.
 
         :returns:
             Dictionary with serialized data.
         """
-        docstore = self.document_store.to_dict()
         return default_to_dict(
-            self, document_store=docstore, filters=self.filters, top_k=self.top_k, scale_score=self.scale_score
+            self,
+            document_store=self.document_store,
+            filters=self.filters,
+            top_k=self.top_k,
+            scale_score=self.scale_score,
+            filter_policy=self.filter_policy.value,
         )
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "InMemoryBM25Retriever":
+    def from_dict(cls, data: dict[str, Any]) -> "InMemoryBM25Retriever":
         """
         Deserializes the component from a dictionary.
 
@@ -97,47 +113,78 @@ class InMemoryBM25Retriever:
             The deserialized component.
         """
         init_params = data.get("init_parameters", {})
-        if "document_store" not in init_params:
-            raise DeserializationError("Missing 'document_store' in serialization data")
-        if "type" not in init_params["document_store"]:
-            raise DeserializationError("Missing 'type' in document store's serialization data")
-        data["init_parameters"]["document_store"] = InMemoryDocumentStore.from_dict(
-            data["init_parameters"]["document_store"]
-        )
+        if "filter_policy" in init_params:
+            init_params["filter_policy"] = FilterPolicy.from_str(init_params["filter_policy"])
         return default_from_dict(cls, data)
 
-    @component.output_types(documents=List[Document])
+    @component.output_types(documents=list[Document])
     def run(
         self,
         query: str,
-        filters: Optional[Dict[str, Any]] = None,
-        top_k: Optional[int] = None,
-        scale_score: Optional[bool] = None,
-    ):
+        filters: dict[str, Any] | None = None,
+        top_k: int | None = None,
+        scale_score: bool | None = None,
+    ) -> dict[str, list[Document]]:
         """
         Run the InMemoryBM25Retriever on the given input data.
 
         :param query:
             The query string for the Retriever.
         :param filters:
-            A dictionary with filters to narrow down the search space.
+            A dictionary with filters to narrow down the search space when retrieving documents.
         :param top_k:
             The maximum number of documents to return.
         :param scale_score:
-            Scales the BM25 score to a unit interval in the range of 0 to 1, where 1 means extremely relevant. If set to `False`, uses raw similarity scores.
-            If not specified, the value provided at initialization is used.
+            When `True`, scales the score of retrieved documents to a range of 0 to 1, where 1 means extremely relevant.
+            When `False`, uses raw similarity scores.
         :returns:
             The retrieved documents.
 
         :raises ValueError:
             If the specified DocumentStore is not found or is not a InMemoryDocumentStore instance.
         """
-        if filters is None:
-            filters = self.filters
+        filters = apply_filter_policy(self.filter_policy, self.filters, filters)
         if top_k is None:
             top_k = self.top_k
         if scale_score is None:
             scale_score = self.scale_score
 
         docs = self.document_store.bm25_retrieval(query=query, filters=filters, top_k=top_k, scale_score=scale_score)
+        return {"documents": docs}
+
+    @component.output_types(documents=list[Document])
+    async def run_async(
+        self,
+        query: str,
+        filters: dict[str, Any] | None = None,
+        top_k: int | None = None,
+        scale_score: bool | None = None,
+    ) -> dict[str, list[Document]]:
+        """
+        Run the InMemoryBM25Retriever on the given input data.
+
+        :param query:
+            The query string for the Retriever.
+        :param filters:
+            A dictionary with filters to narrow down the search space when retrieving documents.
+        :param top_k:
+            The maximum number of documents to return.
+        :param scale_score:
+            When `True`, scales the score of retrieved documents to a range of 0 to 1, where 1 means extremely relevant.
+            When `False`, uses raw similarity scores.
+        :returns:
+            The retrieved documents.
+
+        :raises ValueError:
+            If the specified DocumentStore is not found or is not a InMemoryDocumentStore instance.
+        """
+        filters = apply_filter_policy(self.filter_policy, self.filters, filters)
+        if top_k is None:
+            top_k = self.top_k
+        if scale_score is None:
+            scale_score = self.scale_score
+
+        docs = await self.document_store.bm25_retrieval_async(
+            query=query, filters=filters, top_k=top_k, scale_score=scale_score
+        )
         return {"documents": docs}

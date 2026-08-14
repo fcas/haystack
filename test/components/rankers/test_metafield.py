@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
 #
 # SPDX-License-Identifier: Apache-2.0
+
 import logging
 
 import pytest
@@ -73,6 +74,30 @@ class TestMetaFieldRanker:
         assert len(docs_after) == 3
         assert [doc.meta["rating"] for doc in docs_after] == ["10.5", "2.3", "1.1"]
 
+    def test_run_deduplicates_documents(self):
+        ranker = MetaFieldRanker(meta_field="rating")
+        docs_before = [
+            Document(id="duplicate", content="keep me", meta={"rating": 1.3}, score=0.9),
+            Document(id="duplicate", content="drop me", meta={"rating": 1.2}, score=0.1),
+            Document(id="unique", content="unique", meta={"rating": 2.1}),
+        ]
+        result = ranker.run(documents=docs_before)
+        assert len(result["documents"]) == 2
+        assert result["documents"][0].content == "unique"
+        assert result["documents"][1].content == "keep me"
+
+    def test_run_deduplicates_documents_when_weight_is_0(self):
+        ranker = MetaFieldRanker(meta_field="rating", weight=0)
+        docs_before = [
+            Document(id="duplicate", content="keep me", meta={"rating": 1.3}, score=0.9),
+            Document(id="duplicate", content="drop me", meta={"rating": 1.2}, score=0.1),
+            Document(id="unique", content="unique", meta={"rating": 2.1}),
+        ]
+        result = ranker.run(documents=docs_before)
+        assert len(result["documents"]) == 2
+        assert result["documents"][0].content == "keep me"
+        assert result["documents"][1].content == "unique"
+
     def test_meta_value_type_int(self):
         ranker = MetaFieldRanker(meta_field="rating", weight=1.0, meta_value_type="int")
         docs_before = [Document(content="abc", meta={"rating": value}) for value in ["1", "10", "2"]]
@@ -99,8 +124,8 @@ class TestMetaFieldRanker:
         with caplog.at_level(logging.WARNING):
             ranker.run(documents=docs_before)
             assert (
-                "The parameter <meta_field> is currently set to 'rating', but none of the provided Documents with IDs 1 have this meta key."
-                in caplog.text
+                "The parameter <meta_field> is currently set to 'rating', but none of the provided Documents with IDs "
+                "1 have this meta key." in caplog.text
             )
 
     def test_warning_if_some_meta_not_found(self, caplog):
@@ -112,8 +137,8 @@ class TestMetaFieldRanker:
         with caplog.at_level(logging.WARNING):
             ranker.run(documents=docs_before)
             assert (
-                "The parameter <meta_field> is currently set to 'rating' but the Documents with IDs 1 don't have this meta key."
-                in caplog.text
+                "The parameter <meta_field> is currently set to 'rating' but the Documents with IDs 1 don't have "
+                "this meta key." in caplog.text
             )
 
     def test_warning_if_unsortable_values(self, caplog):
@@ -154,17 +179,26 @@ class TestMetaFieldRanker:
             output = ranker.run(documents=docs_before)
             assert len(output["documents"]) == 3
             assert (
-                "The parameter <meta_value_type> is currently set to 'float', but not all of meta values in the provided Documents with IDs 1,2,3 are strings."
-                in caplog.text
+                "The parameter <meta_value_type> is currently set to 'float', but not all of meta values in the "
+                "provided Documents with IDs 1,2,3 are strings." in caplog.text
             )
 
     def test_raises_value_error_if_wrong_ranking_mode(self):
         with pytest.raises(ValueError):
             MetaFieldRanker(meta_field="rating", ranking_mode="wrong_mode")
 
-    def test_raises_value_error_if_wrong_top_k(self):
-        with pytest.raises(ValueError):
-            MetaFieldRanker(meta_field="rating", top_k=-1)
+    @pytest.mark.parametrize("top_k", [0, -1])
+    def test_raises_value_error_if_wrong_top_k(self, top_k):
+        with pytest.raises(ValueError, match=rf"top_k must be > 0, but got {top_k}"):
+            MetaFieldRanker(meta_field="rating", top_k=top_k)
+
+    @pytest.mark.parametrize(("init_top_k", "run_top_k"), [(None, 0), (1, 0), (1, -1)])
+    def test_run_raises_value_error_if_wrong_top_k(self, init_top_k, run_top_k):
+        ranker = MetaFieldRanker(meta_field="rating", top_k=init_top_k)
+        documents = [Document(content="abc", meta={"rating": 1.3})]
+
+        with pytest.raises(ValueError, match=rf"top_k must be > 0, but got {run_top_k}"):
+            ranker.run(documents=documents, top_k=run_top_k)
 
     @pytest.mark.parametrize("score", [-1, 2, 1.3, 2.1])
     def test_raises_component_error_if_wrong_weight(self, score):
@@ -174,6 +208,10 @@ class TestMetaFieldRanker:
     def test_raises_value_error_if_wrong_sort_order(self):
         with pytest.raises(ValueError):
             MetaFieldRanker(meta_field="rating", sort_order="wrong_order")
+
+    def test_raises_value_error_if_wrong_missing_meta(self):
+        with pytest.raises(ValueError):
+            MetaFieldRanker(meta_field="rating", missing_meta="wrong_missing_meta")
 
     def test_raises_value_error_if_wrong_meta_value_type(self):
         with pytest.raises(ValueError):
@@ -239,3 +277,39 @@ class TestMetaFieldRanker:
         output = ranker.run(documents=docs_before, ranking_mode="reciprocal_rank_fusion")
         docs_after = output["documents"]
         assert docs_after[0].score == pytest.approx(0.016261, abs=1e-5)
+
+    def test_missing_meta_bottom(self):
+        ranker = MetaFieldRanker(meta_field="rating", ranking_mode="linear_score", weight=0.5, missing_meta="bottom")
+        docs_before = [
+            Document(id="1", content="abc", meta={"rating": 1.3}, score=0.6),
+            Document(id="2", content="abc", meta={}, score=0.4),
+            Document(id="3", content="abc", meta={"rating": 2.1}, score=0.39),
+        ]
+        output = ranker.run(documents=docs_before)
+        docs_after = output["documents"]
+        assert len(docs_after) == 3
+        assert docs_after[2].id == "2"
+
+    def test_missing_meta_top(self):
+        ranker = MetaFieldRanker(meta_field="rating", ranking_mode="linear_score", weight=0.5, missing_meta="top")
+        docs_before = [
+            Document(id="1", content="abc", meta={"rating": 1.3}, score=0.6),
+            Document(id="2", content="abc", meta={}, score=0.59),
+            Document(id="3", content="abc", meta={"rating": 2.1}, score=0.4),
+        ]
+        output = ranker.run(documents=docs_before)
+        docs_after = output["documents"]
+        assert len(docs_after) == 3
+        assert docs_after[0].id == "2"
+
+    def test_missing_meta_drop(self):
+        ranker = MetaFieldRanker(meta_field="rating", ranking_mode="linear_score", weight=0.5, missing_meta="drop")
+        docs_before = [
+            Document(id="1", content="abc", meta={"rating": 1.3}, score=0.6),
+            Document(id="2", content="abc", meta={}, score=0.59),
+            Document(id="3", content="abc", meta={"rating": 2.1}, score=0.4),
+        ]
+        output = ranker.run(documents=docs_before)
+        docs_after = output["documents"]
+        assert len(docs_after) == 2
+        assert "2" not in [doc.id for doc in docs_after]

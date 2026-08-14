@@ -4,16 +4,21 @@
 
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any
 
 
 class SecretType(Enum):
+    """
+    Type of secret: token (API key) or environment variable.
+    """
+
     TOKEN = "token"
     ENV_VAR = "env_var"
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.value
 
     @staticmethod
@@ -36,10 +41,10 @@ class Secret(ABC):
 
     Usage example:
     ```python
-    from haystack.components.generators import OpenAIGenerator
+    from haystack.components.generators.chat import OpenAIChatGenerator
     from haystack.utils import Secret
 
-    generator = OpenAIGenerator(api_key=Secret.from_token("<here_goes_your_token>"))
+    generator = OpenAIChatGenerator(api_key=Secret.from_token("<here_goes_your_token>"))
     ```
     """
 
@@ -54,7 +59,7 @@ class Secret(ABC):
         return TokenSecret(_token=token)
 
     @staticmethod
-    def from_env_var(env_vars: Union[str, List[str]], *, strict: bool = True) -> "Secret":
+    def from_env_var(env_vars: str | list[str], *, strict: bool = True) -> "Secret":
         """
         Create an environment variable-based secret. Accepts one or more environment variables.
 
@@ -71,7 +76,7 @@ class Secret(ABC):
             env_vars = [env_vars]
         return EnvVarSecret(_env_vars=tuple(env_vars), _strict=strict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """
         Convert the secret to a JSON-serializable dictionary.
 
@@ -82,12 +87,12 @@ class Secret(ABC):
         """
         out = {"type": self.type.value}
         inner = self._to_dict()
-        assert all(k not in inner for k in out.keys())
+        assert all(k not in inner for k in out)
         out.update(inner)
         return out
 
     @staticmethod
-    def from_dict(dict: Dict[str, Any]) -> "Secret":  # noqa:A002
+    def from_dict(dict: dict[str, Any]) -> "Secret":  # noqa:A002
         """
         Create a secret from a JSON-serializable dictionary.
 
@@ -101,7 +106,7 @@ class Secret(ABC):
         return secret_map[secret_type]._from_dict(dict)  # type: ignore
 
     @abstractmethod
-    def resolve_value(self) -> Optional[Any]:
+    def resolve_value(self) -> Any | None:
         """
         Resolve the secret to an atomic value. The semantics of the value is secret-dependent.
 
@@ -119,12 +124,12 @@ class Secret(ABC):
         pass
 
     @abstractmethod
-    def _to_dict(self) -> Dict[str, Any]:
+    def _to_dict(self) -> dict[str, Any]:
         pass
 
     @staticmethod
     @abstractmethod
-    def _from_dict(_: Dict[str, Any]) -> "Secret":
+    def _from_dict(_: dict[str, Any]) -> "Secret":
         pass
 
 
@@ -139,25 +144,29 @@ class TokenSecret(Secret):
     _token: str
     _type: SecretType = SecretType.TOKEN
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         super().__init__()
         assert self._type == SecretType.TOKEN
 
         if len(self._token) == 0:
             raise ValueError("Authentication token cannot be empty.")
 
-    def _to_dict(self) -> Dict[str, Any]:
+    def _to_dict(self) -> dict[str, Any]:
         raise ValueError(
             "Cannot serialize token-based secret. Use an alternative secret type like environment variables."
         )
 
     @staticmethod
-    def _from_dict(_: Dict[str, Any]) -> "Secret":
+    def _from_dict(_: dict[str, Any]) -> "Secret":
         raise ValueError(
             "Cannot deserialize token-based secret. Use an alternative secret type like environment variables."
         )
 
-    def resolve_value(self) -> Optional[Any]:
+    def __repr__(self) -> str:
+        # Hide the token so it can't leak through print/log/traceback formatting.
+        return f"TokenSecret(_token=<redacted>, _type={self._type!r})"
+
+    def resolve_value(self) -> Any | None:
         """Return the token."""
         return self._token
 
@@ -175,25 +184,25 @@ class EnvVarSecret(Secret):
     Upon resolution, it returns a string token from the first environment variable that is set. Can be serialized.
     """
 
-    _env_vars: Tuple[str, ...]
+    _env_vars: tuple[str, ...]
     _strict: bool = True
     _type: SecretType = SecretType.ENV_VAR
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         super().__init__()
         assert self._type == SecretType.ENV_VAR
 
         if len(self._env_vars) == 0:
             raise ValueError("One or more environment variables must be provided for the secret.")
 
-    def _to_dict(self) -> Dict[str, Any]:
+    def _to_dict(self) -> dict[str, Any]:
         return {"env_vars": list(self._env_vars), "strict": self._strict}
 
     @staticmethod
-    def _from_dict(dictionary: Dict[str, Any]) -> "Secret":
+    def _from_dict(dictionary: dict[str, Any]) -> "Secret":
         return EnvVarSecret(tuple(dictionary["env_vars"]), _strict=dictionary["strict"])
 
-    def resolve_value(self) -> Optional[Any]:
+    def resolve_value(self) -> Any | None:
         """Resolve the secret to an atomic value. The semantics of the value is secret-dependent."""
         out = None
         for env_var in self._env_vars:
@@ -211,7 +220,7 @@ class EnvVarSecret(Secret):
         return self._type
 
 
-def deserialize_secrets_inplace(data: Dict[str, Any], keys: Iterable[str], *, recursive: bool = False):
+def deserialize_secrets_inplace(data: dict[str, Any], keys: Iterable[str], *, recursive: bool = False) -> None:
     """
     Deserialize secrets in a dictionary inplace.
 

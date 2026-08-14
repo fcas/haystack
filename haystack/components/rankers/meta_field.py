@@ -3,11 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Literal, Optional
+from collections.abc import Callable
+from dataclasses import replace
+from typing import Any, Literal
 
 from dateutil.parser import parse as date_parse
 
 from haystack import Document, component, logging
+from haystack.utils.misc import _deduplicate_documents
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +23,8 @@ class MetaFieldRanker:
     The ranking can be performed in descending order or ascending order.
 
     Usage example:
-    ```
+
+    ```python
     from haystack import Document
     from haystack.components.rankers import MetaFieldRanker
 
@@ -34,17 +38,19 @@ class MetaFieldRanker:
     output = ranker.run(documents=docs)
     docs = output["documents"]
     assert docs[0].content == "Barcelona"
+    ```
     """
 
     def __init__(
         self,
         meta_field: str,
         weight: float = 1.0,
-        top_k: Optional[int] = None,
+        top_k: int | None = None,
         ranking_mode: Literal["reciprocal_rank_fusion", "linear_score"] = "reciprocal_rank_fusion",
         sort_order: Literal["ascending", "descending"] = "descending",
-        meta_value_type: Optional[Literal["float", "int", "date"]] = None,
-    ):
+        missing_meta: Literal["drop", "top", "bottom"] = "bottom",
+        meta_value_type: Literal["float", "int", "date"] | None = None,
+    ) -> None:
         """
         Creates an instance of MetaFieldRanker.
 
@@ -65,6 +71,14 @@ class MetaFieldRanker:
         :param sort_order:
             Whether to sort the meta field by ascending or descending order.
             Possible values are `descending` (default) and `ascending`.
+        :param missing_meta:
+            What to do with documents that are missing the sorting metadata field.
+            Possible values are:
+                - 'drop' will drop the documents entirely.
+                - 'top' will place the documents at the top of the metadata-sorted list
+                    (regardless of 'ascending' or 'descending').
+                - 'bottom' will place the documents at the bottom of metadata-sorted list
+                    (regardless of 'ascending' or 'descending').
         :param meta_value_type:
             Parse the meta value into the data type specified before sorting.
             This will only work if all meta values stored under `meta_field` in the provided documents are strings.
@@ -82,67 +96,80 @@ class MetaFieldRanker:
         self.top_k = top_k
         self.ranking_mode = ranking_mode
         self.sort_order = sort_order
+        self.missing_meta = missing_meta
         self._validate_params(
             weight=self.weight,
             top_k=self.top_k,
             ranking_mode=self.ranking_mode,
             sort_order=self.sort_order,
+            missing_meta=self.missing_meta,
             meta_value_type=meta_value_type,
         )
         self.meta_value_type = meta_value_type
 
     def _validate_params(
         self,
+        *,
         weight: float,
-        top_k: Optional[int],
+        top_k: int | None,
         ranking_mode: Literal["reciprocal_rank_fusion", "linear_score"],
         sort_order: Literal["ascending", "descending"],
-        meta_value_type: Optional[Literal["float", "int", "date"]],
-    ):
+        missing_meta: Literal["drop", "top", "bottom"],
+        meta_value_type: Literal["float", "int", "date"] | None,
+    ) -> None:
         if top_k is not None and top_k <= 0:
-            raise ValueError("top_k must be > 0, but got %s" % top_k)
+            raise ValueError(f"top_k must be > 0, but got {top_k}")
 
         if weight < 0 or weight > 1:
             raise ValueError(
-                "Parameter <weight> must be in range [0,1] but is currently set to '%s'.\n'0' disables sorting by a "
-                "meta field, '0.5' assigns equal weight to the previous relevance scores and the meta field, and "
+                f"Parameter <weight> must be in range [0,1] but is currently set to '{weight}'.\n'0' disables sorting "
+                "by a meta field, '0.5' assigns equal weight to the previous relevance scores and the meta field, and "
                 "'1' ranks by the meta field only.\nChange the <weight> parameter to a value in range 0 to 1 when "
-                "initializing the MetaFieldRanker." % weight
+                "initializing the MetaFieldRanker."
             )
 
         if ranking_mode not in ["reciprocal_rank_fusion", "linear_score"]:
             raise ValueError(
                 "The value of parameter <ranking_mode> must be 'reciprocal_rank_fusion' or 'linear_score', but is "
-                "currently set to '%s'.\nChange the <ranking_mode> value to 'reciprocal_rank_fusion' or "
-                "'linear_score' when initializing the MetaFieldRanker." % ranking_mode
+                f"currently set to '{ranking_mode}'.\nChange the <ranking_mode> value to 'reciprocal_rank_fusion' or "
+                "'linear_score' when initializing the MetaFieldRanker."
             )
 
         if sort_order not in ["ascending", "descending"]:
             raise ValueError(
                 "The value of parameter <sort_order> must be 'ascending' or 'descending', "
-                "but is currently set to '%s'.\n"
+                f"but is currently set to '{sort_order}'.\n"
                 "Change the <sort_order> value to 'ascending' or 'descending' when initializing the "
-                "MetaFieldRanker." % sort_order
+                "MetaFieldRanker."
+            )
+
+        if missing_meta not in ["drop", "top", "bottom"]:
+            raise ValueError(
+                "The value of parameter <missing_meta> must be 'drop', 'top', or 'bottom', "
+                f"but is currently set to '{missing_meta}'.\n"
+                "Change the <missing_meta> value to 'drop', 'top', or 'bottom' when initializing the "
+                "MetaFieldRanker."
             )
 
         if meta_value_type not in ["float", "int", "date", None]:
             raise ValueError(
                 "The value of parameter <meta_value_type> must be 'float', 'int', 'date' or None but is "
-                "currently set to '%s'.\n"
+                f"currently set to '{meta_value_type}'.\n"
                 "Change the <meta_value_type> value to 'float', 'int', 'date' or None when initializing the "
-                "MetaFieldRanker." % meta_value_type
+                "MetaFieldRanker."
             )
 
-    @component.output_types(documents=List[Document])
+    @component.output_types(documents=list[Document])
     def run(
         self,
-        documents: List[Document],
-        top_k: Optional[int] = None,
-        weight: Optional[float] = None,
-        ranking_mode: Optional[Literal["reciprocal_rank_fusion", "linear_score"]] = None,
-        sort_order: Optional[Literal["ascending", "descending"]] = None,
-        meta_value_type: Optional[Literal["float", "int", "date"]] = None,
-    ):
+        documents: list[Document],
+        top_k: int | None = None,
+        weight: float | None = None,
+        ranking_mode: Literal["reciprocal_rank_fusion", "linear_score"] | None = None,
+        sort_order: Literal["ascending", "descending"] | None = None,
+        missing_meta: Literal["drop", "top", "bottom"] | None = None,
+        meta_value_type: Literal["float", "int", "date"] | None = None,
+    ) -> dict[str, Any]:
         """
         Ranks a list of Documents based on the selected meta field by:
 
@@ -150,6 +177,9 @@ class MetaFieldRanker:
         2. Merging the rankings from the previous component and based on the meta field according to ranking mode and
         weight.
         3. Returning the top-k documents.
+
+        Before ranking, documents are deduplicated by their id, retaining only the document with the highest score
+        if a score is present.
 
         :param documents:
             Documents to be ranked.
@@ -171,6 +201,15 @@ class MetaFieldRanker:
             Whether to sort the meta field by ascending or descending order.
             Possible values are `descending` (default) and `ascending`.
             If not provided, the sort_order provided at initialization time is used.
+        :param missing_meta:
+            What to do with documents that are missing the sorting metadata field.
+            Possible values are:
+            - 'drop' will drop the documents entirely.
+            - 'top' will place the documents at the top of the metadata-sorted list
+                (regardless of 'ascending' or 'descending').
+            - 'bottom' will place the documents at the bottom of metadata-sorted list
+                (regardless of 'ascending' or 'descending').
+            If not provided, the missing_meta provided at initialization time is used.
         :param meta_value_type:
             Parse the meta value into the data type specified before sorting.
             This will only work if all meta values stored under `meta_field` in the provided documents are strings.
@@ -195,48 +234,69 @@ class MetaFieldRanker:
         if not documents:
             return {"documents": []}
 
-        top_k = top_k or self.top_k
+        top_k = self.top_k if top_k is None else top_k
         weight = weight if weight is not None else self.weight
         ranking_mode = ranking_mode or self.ranking_mode
         sort_order = sort_order or self.sort_order
+        missing_meta = missing_meta or self.missing_meta
         meta_value_type = meta_value_type or self.meta_value_type
         self._validate_params(
             weight=weight,
             top_k=top_k,
             ranking_mode=ranking_mode,
             sort_order=sort_order,
+            missing_meta=missing_meta,
             meta_value_type=meta_value_type,
         )
 
+        deduplicated_documents = _deduplicate_documents(documents)
         # If the weight is 0 then ranking by meta field is disabled and the original documents should be returned
         if weight == 0:
-            return {"documents": documents[:top_k]}
+            return {"documents": deduplicated_documents[:top_k]}
 
-        docs_with_meta_field = [doc for doc in documents if self.meta_field in doc.meta]
-        docs_missing_meta_field = [doc for doc in documents if self.meta_field not in doc.meta]
+        docs_with_meta_field = [doc for doc in deduplicated_documents if self.meta_field in doc.meta]
+        docs_missing_meta_field = [doc for doc in deduplicated_documents if self.meta_field not in doc.meta]
 
         # If all docs are missing self.meta_field return original documents
         if len(docs_with_meta_field) == 0:
             logger.warning(
-                "The parameter <meta_field> is currently set to '{meta_field}', but none of the provided Documents with IDs {document_ids} have this meta key.\n"
+                "The parameter <meta_field> is currently set to '{meta_field}', but none of the provided "
+                "Documents with IDs {document_ids} have this meta key.\n"
                 "Set <meta_field> to the name of a field that is present within the provided Documents.\n"
                 "Returning the <top_k> of the original Documents since there are no values to rank.",
                 meta_field=self.meta_field,
-                document_ids=",".join([doc.id for doc in documents]),
+                document_ids=",".join([doc.id for doc in deduplicated_documents]),
             )
-            return {"documents": documents[:top_k]}
+            return {"documents": deduplicated_documents[:top_k]}
 
         if len(docs_missing_meta_field) > 0:
-            logger.warning(
-                "The parameter <meta_field> is currently set to '{meta_field}' but the Documents with IDs {document_ids} don't have this meta key.\n"
-                "These Documents will be placed at the end of the sorting order.",
-                meta_field=self.meta_field,
-                document_ids=",".join([doc.id for doc in docs_missing_meta_field]),
+            warning_start = (
+                f"The parameter <meta_field> is currently set to '{self.meta_field}' but the Documents "
+                f"with IDs {','.join([doc.id for doc in docs_missing_meta_field])} don't have this meta key.\n"
             )
+
+            if missing_meta == "bottom":
+                logger.warning(
+                    "{warning_start}Because the parameter <missing_meta> is set to 'bottom', these Documents will be "
+                    "placed at the end of the sorting order.",
+                    warning_start=warning_start,
+                )
+            elif missing_meta == "top":
+                logger.warning(
+                    "{warning_start}Because the parameter <missing_meta> is set to 'top', these Documents will be "
+                    "placed at the top of the sorting order.",
+                    warning_start=warning_start,
+                )
+            else:
+                logger.warning(
+                    "{warning_start}Because the parameter <missing_meta> is set to 'drop', these Documents will be "
+                    "removed from the list of retrieved Documents.",
+                    warning_start=warning_start,
+                )
 
         # If meta_value_type is provided try to parse the meta values
         parsed_meta = self._parse_meta(docs_with_meta_field=docs_with_meta_field, meta_value_type=meta_value_type)
-        tuple_parsed_meta_and_docs = list(zip(parsed_meta, docs_with_meta_field))
+        tuple_parsed_meta_and_docs = list(zip(parsed_meta, docs_with_meta_field, strict=True))
 
         # Sort the documents by self.meta_field
         reverse = sort_order == "descending"
@@ -250,17 +310,25 @@ class MetaFieldRanker:
                 document_ids=",".join([doc.id for doc in docs_with_meta_field]),
                 error=error,
             )
-            return {"documents": documents[:top_k]}
+            return {"documents": deduplicated_documents[:top_k]}
 
-        # Add the docs missing the meta_field back on the end
+        # Merge rankings and handle missing meta fields as specified in the missing_meta parameter
         sorted_by_meta = [doc for meta, doc in tuple_sorted_by_meta]
-        sorted_documents = sorted_by_meta + docs_missing_meta_field
-        sorted_documents = self._merge_rankings(documents, sorted_documents, weight, ranking_mode)
+        if missing_meta == "bottom":
+            sorted_documents = sorted_by_meta + docs_missing_meta_field
+            sorted_documents = self._merge_rankings(deduplicated_documents, sorted_documents, weight, ranking_mode)
+        elif missing_meta == "top":
+            sorted_documents = docs_missing_meta_field + sorted_by_meta
+            sorted_documents = self._merge_rankings(deduplicated_documents, sorted_documents, weight, ranking_mode)
+        else:
+            sorted_documents = sorted_by_meta
+            sorted_documents = self._merge_rankings(docs_with_meta_field, sorted_documents, weight, ranking_mode)
+
         return {"documents": sorted_documents[:top_k]}
 
     def _parse_meta(
-        self, docs_with_meta_field: List[Document], meta_value_type: Optional[Literal["float", "int", "date"]]
-    ) -> List[Any]:
+        self, docs_with_meta_field: list[Document], meta_value_type: Literal["float", "int", "date"] | None
+    ) -> list[Any]:
         """
         Parse the meta values stored under `self.meta_field` for the Documents provided in `docs_with_meta_field`.
         """
@@ -291,7 +359,8 @@ class MetaFieldRanker:
             meta_values = [parse_fn(d.meta[self.meta_field]) for d in docs_with_meta_field]
         except ValueError as error:
             logger.warning(
-                "Tried to parse the meta values of Documents with IDs {document_ids}, but got ValueError with the message: {error}\n"
+                "Tried to parse the meta values of Documents with IDs {document_ids}, but got ValueError with the "
+                "message: {error}\n"
                 "Skipping parsing of the meta values.",
                 document_ids=",".join([doc.id for doc in docs_with_meta_field]),
                 error=error,
@@ -302,22 +371,22 @@ class MetaFieldRanker:
 
     def _merge_rankings(
         self,
-        documents: List[Document],
-        sorted_documents: List[Document],
+        documents: list[Document],
+        sorted_documents: list[Document],
         weight: float,
         ranking_mode: Literal["reciprocal_rank_fusion", "linear_score"],
-    ) -> List[Document]:
+    ) -> list[Document]:
         """
         Merge the two different rankings for Documents sorted both by their content and by their meta field.
         """
-        scores_map: Dict = defaultdict(int)
+        scores_map: dict = defaultdict(int)
 
         if ranking_mode == "reciprocal_rank_fusion":
-            for i, (document, sorted_doc) in enumerate(zip(documents, sorted_documents)):
+            for i, (document, sorted_doc) in enumerate(zip(documents, sorted_documents, strict=True)):
                 scores_map[document.id] += self._calculate_rrf(rank=i) * (1 - weight)
                 scores_map[sorted_doc.id] += self._calculate_rrf(rank=i) * weight
         elif ranking_mode == "linear_score":
-            for i, (document, sorted_doc) in enumerate(zip(documents, sorted_documents)):
+            for i, (document, sorted_doc) in enumerate(zip(documents, sorted_documents, strict=True)):
                 score = float(0)
                 if document.score is None:
                     logger.warning("The score wasn't provided; defaulting to 0.")
@@ -333,11 +402,9 @@ class MetaFieldRanker:
                 scores_map[document.id] += score * (1 - weight)
                 scores_map[sorted_doc.id] += self._calc_linear_score(rank=i, amount=len(sorted_documents)) * weight
 
-        for document in documents:
-            document.score = scores_map[document.id]
+        scored_docs = [replace(doc, score=scores_map[doc.id]) for doc in documents]
 
-        new_sorted_documents = sorted(documents, key=lambda doc: doc.score if doc.score else -1, reverse=True)
-        return new_sorted_documents
+        return sorted(scored_docs, key=lambda doc: doc.score if doc.score else -1, reverse=True)
 
     @staticmethod
     def _calculate_rrf(rank: int, k: int = 61) -> float:

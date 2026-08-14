@@ -2,8 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List, Union
-
 from haystack.core.component import component
 
 
@@ -13,8 +11,8 @@ class Concatenate:
     Concatenates two values
     """
 
-    @component.output_types(value=List[str])
-    def run(self, first: Union[List[str], str], second: Union[List[str], str]):
+    @component.output_types(value=list[str])
+    def run(self, first: list[str] | str, second: list[str] | str):
         """
         Concatenates two values
         """
@@ -26,4 +24,6 @@ class Concatenate:
             res = first + [second]
         elif isinstance(first, str) and isinstance(second, list):
             res = [first] + second
+        else:
+            res = None
         return {"value": res}

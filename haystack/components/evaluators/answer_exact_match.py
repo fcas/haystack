@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Dict, List
+from typing import Any
 
 from haystack.core.component import component
 
@@ -35,8 +35,8 @@ class AnswerExactMatchEvaluator:
     ```
     """
 
-    @component.output_types(individual_scores=List[int], score=float)
-    def run(self, ground_truth_answers: List[str], predicted_answers: List[str]) -> Dict[str, Any]:
+    @component.output_types(individual_scores=list[int], score=float)
+    def run(self, ground_truth_answers: list[str], predicted_answers: list[str]) -> dict[str, Any]:
         """
         Run the AnswerExactMatchEvaluator on the given inputs.
 
@@ -48,7 +48,8 @@ class AnswerExactMatchEvaluator:
             A list of predicted answers.
         :returns:
             A dictionary with the following outputs:
-            - `individual_scores` - A list of 0s and 1s, where 1 means that the predicted answer matched one of the ground truth.
+            - `individual_scores` - A list of 0s and 1s, where 1 means that the predicted answer matched one of the
+                ground truth.
             - `score` - A number from 0.0 to 1.0 that represents the proportion of questions where any predicted
                          answer matched one of the ground truth answers.
         """
@@ -56,7 +57,7 @@ class AnswerExactMatchEvaluator:
             raise ValueError("The length of ground_truth_answers and predicted_answers must be the same.")
 
         matches = []
-        for truth, extracted in zip(ground_truth_answers, predicted_answers):
+        for truth, extracted in zip(ground_truth_answers, predicted_answers, strict=True):
             if truth == extracted:
                 matches.append(1)
             else:

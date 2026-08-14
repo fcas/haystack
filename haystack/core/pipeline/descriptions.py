@@ -2,24 +2,28 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Dict, List
 
-import networkx  # type:ignore
+import networkx
 
-from haystack import logging
 from haystack.core.component.types import InputSocket, OutputSocket
-from haystack.core.type_utils import _type_name
-
-logger = logging.getLogger(__name__)
 
 
 def find_pipeline_inputs(
     graph: networkx.MultiDiGraph, include_connected_sockets: bool = False
-) -> Dict[str, List[InputSocket]]:
+) -> dict[str, list[InputSocket]]:
     """
     Collect components that have disconnected/connected input sockets.
 
     Note that this method returns *ALL* disconnected input sockets, including all such sockets with default values.
+    It also includes variadic input sockets, even if they are currently connected, as they can accept additional
+    inputs from outside the pipeline.
+
+    :param graph: The pipeline graph to analyze.
+    :param include_connected_sockets: If True, also include input sockets that are already connected.
+        This can be useful for understanding the full input requirements of the pipeline, including inputs
+        that are currently satisfied by connections within the pipeline. If False, only include input sockets that
+        are not connected to any output socket, which represent the external inputs that can be provided when running
+        the pipeline.
     """
     return {
         name: [
@@ -33,7 +37,7 @@ def find_pipeline_inputs(
 
 def find_pipeline_outputs(
     graph: networkx.MultiDiGraph, include_connected_sockets: bool = False
-) -> Dict[str, List[OutputSocket]]:
+) -> dict[str, list[OutputSocket]]:
     """
     Collect components that have disconnected/connected output sockets. They define the pipeline output.
     """
@@ -45,29 +49,3 @@ def find_pipeline_outputs(
         ]
         for name, data in graph.nodes(data=True)
     }
-
-
-def describe_pipeline_inputs(graph: networkx.MultiDiGraph):
-    """
-    Returns a dictionary with the input names and types that this pipeline accepts.
-    """
-    inputs = {
-        comp: {socket.name: {"type": socket.type, "is_mandatory": socket.is_mandatory} for socket in data}
-        for comp, data in find_pipeline_inputs(graph).items()
-        if data
-    }
-    return inputs
-
-
-def describe_pipeline_inputs_as_string(graph: networkx.MultiDiGraph):
-    """
-    Returns a string representation of the input names and types that this pipeline accepts.
-    """
-    inputs = describe_pipeline_inputs(graph)
-    message = "This pipeline expects the following inputs:\n"
-    for comp, sockets in inputs.items():
-        if sockets:
-            message += f"- {comp}:\n"
-            for name, socket in sockets.items():
-                message += f"    - {name}: {_type_name(socket['type'])}\n"
-    return message

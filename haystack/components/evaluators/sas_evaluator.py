@@ -2,16 +2,16 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from numpy import mean as np_mean
 
 from haystack import component, default_from_dict, default_to_dict
 from haystack.lazy_imports import LazyImport
 from haystack.utils import ComponentDevice, expit
-from haystack.utils.auth import Secret, deserialize_secrets_inplace
+from haystack.utils.auth import Secret
 
-with LazyImport(message="Run 'pip install scikit-learn \"sentence-transformers>=2.2.0\"'") as sas_import:
+with LazyImport(message="Run 'pip install \"sentence-transformers>=5.0.0\"'") as sas_import:
     from sentence_transformers import CrossEncoder, SentenceTransformer, util
     from transformers import AutoConfig
 
@@ -19,11 +19,10 @@ with LazyImport(message="Run 'pip install scikit-learn \"sentence-transformers>=
 @component
 class SASEvaluator:
     """
-    SASEvaluator computes the Semantic Answer Similarity (SAS) between a list of predictions and a list of ground truths.
+    SASEvaluator computes the Semantic Answer Similarity (SAS) between a list of predictions and a one of ground truths.
 
-    It's usually used in Retrieval Augmented Generation (RAG) pipelines to evaluate the quality of the generated answers.
-
-    The SAS is computed using a pre-trained model from the Hugging Face model hub. The model can be either a
+    It's usually used in Retrieval Augmented Generation (RAG) pipelines to evaluate the quality of the generated
+    answers. The SAS is computed using a pre-trained model from the Hugging Face model hub. The model can be either a
     Bi-Encoder or a Cross-Encoder. The choice of the model is based on the `model` parameter.
 
     Usage example:
@@ -31,7 +30,6 @@ class SASEvaluator:
     from haystack.components.evaluators.sas_evaluator import SASEvaluator
 
     evaluator = SASEvaluator(model="cross-encoder/ms-marco-MiniLM-L-6-v2")
-    evaluator.warm_up()
     ground_truths = [
         "A construction budget of US $2.3 billion",
         "The Eiffel Tower, completed in 1889, symbolizes Paris's cultural magnificence.",
@@ -43,7 +41,7 @@ class SASEvaluator:
         "The Meiji Restoration in 1868 transformed Japan into a modernized world power.",
     ]
     result = evaluator.run(
-        ground_truths_answers=ground_truths, predicted_answers=predictions
+        ground_truth_answers=ground_truths, predicted_answers=predictions
     )
 
     print(result["score"])
@@ -58,14 +56,15 @@ class SASEvaluator:
         self,
         model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
         batch_size: int = 32,
-        device: Optional[ComponentDevice] = None,
-        token: Secret = Secret.from_env_var("HF_API_TOKEN", strict=False),
-    ):
+        device: ComponentDevice | None = None,
+        token: Secret = Secret.from_env_var(["HF_API_TOKEN", "HF_TOKEN"], strict=False),
+    ) -> None:
         """
         Creates a new instance of SASEvaluator.
 
         :param model:
-            SentenceTransformers semantic textual similarity model, should be path or string pointing to a downloadable model.
+            SentenceTransformers semantic textual similarity model, should be path or string pointing to a downloadable
+            model.
         :param batch_size:
             Number of prediction-label pairs to encode at once.
         :param device:
@@ -80,9 +79,9 @@ class SASEvaluator:
         self._batch_size = batch_size
         self._device = device
         self._token = token
-        self._similarity_model = None
+        self._similarity_model: SentenceTransformer | CrossEncoder | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """
         Serialize this component to a dictionary.
 
@@ -90,15 +89,11 @@ class SASEvaluator:
             The serialized component as a dictionary.
         """
         return default_to_dict(
-            self,
-            model=self._model,
-            batch_size=self._batch_size,
-            device=self._device.to_dict() if self._device else None,
-            token=self._token.to_dict() if self._token else None,
+            self, model=self._model, batch_size=self._batch_size, device=self._device, token=self._token
         )
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "SASEvaluator":
+    def from_dict(cls, data: dict[str, Any]) -> "SASEvaluator":
         """
         Deserialize this component from a dictionary.
 
@@ -107,15 +102,15 @@ class SASEvaluator:
         :returns:
             The deserialized component instance.
         """
-        deserialize_secrets_inplace(data["init_parameters"], keys=["token"])
-        if device := data.get("init_parameters", {}).get("device"):
-            data["init_parameters"]["device"] = ComponentDevice.from_dict(device)
         return default_from_dict(cls, data)
 
-    def warm_up(self):
+    def warm_up(self) -> None:
         """
         Initializes the component.
         """
+        if self._similarity_model:
+            return
+
         token = self._token.resolve_value() if self._token else None
         config = AutoConfig.from_pretrained(self._model, use_auth_token=token)
         cross_encoder_used = False
@@ -125,17 +120,12 @@ class SASEvaluator:
         # Based on the Model string we can load either Bi-Encoders or Cross Encoders.
         # Similarity computation changes for both approaches
         if cross_encoder_used:
-            self._similarity_model = CrossEncoder(
-                self._model,
-                device=device,
-                tokenizer_args={"use_auth_token": token},
-                automodel_args={"use_auth_token": token},
-            )
+            self._similarity_model = CrossEncoder(self._model, device=device, token=token)
         else:
-            self._similarity_model = SentenceTransformer(self._model, device=device, use_auth_token=token)
+            self._similarity_model = SentenceTransformer(self._model, device=device, token=token)
 
-    @component.output_types(score=float, individual_scores=List[float])
-    def run(self, ground_truth_answers: List[str], predicted_answers: List[str]) -> Dict[str, Any]:
+    @component.output_types(score=float, individual_scores=list[float])
+    def run(self, ground_truth_answers: list[str], predicted_answers: list[str]) -> dict[str, float | list[float]]:
         """
         SASEvaluator component run method.
 
@@ -154,16 +144,18 @@ class SASEvaluator:
         if len(ground_truth_answers) != len(predicted_answers):
             raise ValueError("The number of predictions and labels must be the same.")
 
+        if any(answer is None for answer in predicted_answers):
+            raise ValueError("Predicted answers must not contain None values.")
+
         if len(predicted_answers) == 0:
             return {"score": 0.0, "individual_scores": [0.0]}
 
         if not self._similarity_model:
-            msg = "The model has not been initialized. Call warm_up() before running the evaluator."
-            raise RuntimeError(msg)
+            self.warm_up()
 
         if isinstance(self._similarity_model, CrossEncoder):
             # For Cross Encoders we create a list of pairs of predictions and labels
-            sentence_pairs = list(zip(predicted_answers, ground_truth_answers))
+            sentence_pairs = list(zip(predicted_answers, ground_truth_answers, strict=True))
             similarity_scores = self._similarity_model.predict(
                 sentence_pairs, batch_size=self._batch_size, convert_to_numpy=True
             )
@@ -176,7 +168,7 @@ class SASEvaluator:
             # Convert scores to list of floats from numpy array
             similarity_scores = similarity_scores.tolist()
 
-        else:
+        elif isinstance(self._similarity_model, SentenceTransformer):
             # For Bi-encoders we create embeddings separately for predictions and labels
             predictions_embeddings = self._similarity_model.encode(
                 predicted_answers, batch_size=self._batch_size, convert_to_tensor=True
@@ -187,7 +179,8 @@ class SASEvaluator:
 
             # Compute cosine-similarities
             similarity_scores = [
-                float(util.cos_sim(p, l).cpu().numpy()) for p, l in zip(predictions_embeddings, label_embeddings)
+                float(util.cos_sim(pred_embedding, label_embedding).cpu().squeeze().numpy())
+                for pred_embedding, label_embedding in zip(predictions_embeddings, label_embeddings, strict=True)
             ]
 
         sas_score = np_mean(similarity_scores)

@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any
 
 from haystack.core.component import Component, component
 from haystack.core.serialization import default_from_dict, default_to_dict
@@ -12,11 +12,11 @@ from haystack.document_stores.types import DocumentStore, DuplicatePolicy
 
 def document_store_class(
     name: str,
-    documents: Optional[List[Document]] = None,
-    documents_count: Optional[int] = None,
-    bases: Optional[Tuple[type, ...]] = None,
-    extra_fields: Optional[Dict[str, Any]] = None,
-) -> Type[DocumentStore]:
+    documents: list[Document] | None = None,
+    documents_count: int | None = None,
+    bases: tuple[type, ...] | None = None,
+    extra_fields: dict[str, Any] | None = None,
+) -> type[DocumentStore]:
     """
     Utility function to create a DocumentStore class with the given name and list of documents.
 
@@ -88,21 +88,21 @@ def document_store_class(
     elif documents_count is None:
         documents_count = 0
 
-    def count_documents(self) -> Union[int, None]:
+    def count_documents(self) -> int | None:  # noqa: ARG001
         return documents_count
 
-    def filter_documents(self, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
+    def filter_documents(self, filters: dict[str, Any] | None = None) -> list[Document]:  # noqa: ARG001
         if documents is not None:
             return documents
         return []
 
-    def write_documents(self, documents: List[Document], policy: DuplicatePolicy = DuplicatePolicy.FAIL) -> None:
+    def write_documents(self, documents: list[Document], policy: DuplicatePolicy = DuplicatePolicy.FAIL) -> None:  # noqa: ARG001
         return
 
-    def delete_documents(self, document_ids: List[str]) -> None:
+    def delete_documents(self, document_ids: list[str]) -> None:  # noqa: ARG001
         return
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return default_to_dict(self)
 
     fields = {
@@ -120,18 +120,17 @@ def document_store_class(
     if bases is None:
         bases = (object,)
 
-    cls = type(name, bases, fields)
-    return cls
+    return type(name, bases, fields)
 
 
 def component_class(
     name: str,
-    input_types: Optional[Dict[str, Any]] = None,
-    output_types: Optional[Dict[str, Any]] = None,
-    output: Optional[Dict[str, Any]] = None,
-    bases: Optional[Tuple[type, ...]] = None,
-    extra_fields: Optional[Dict[str, Any]] = None,
-) -> Type[Component]:
+    input_types: dict[str, Any] | None = None,
+    output_types: dict[str, Any] | None = None,
+    output: dict[str, Any] | None = None,
+    bases: tuple[type, ...] | None = None,
+    extra_fields: dict[str, Any] | None = None,
+) -> type[Component]:
     """
     Utility class to create a Component class with the given name and input and output types.
 
@@ -209,17 +208,17 @@ def component_class(
         component.set_output_types(self, **output_types)
 
     # Both arguments are necessary to correctly define
-    # run but pylint doesn't like that we don't use them.
+    # run but ruff doesn't like that we don't use them.
     # It's fine ignoring the warning here.
-    def run(self, **kwargs):  # pylint: disable=unused-argument
+    def run(self, **kwargs):  # noqa: ARG001
         if output is not None:
             return output
-        return {name: None for name in output_types.keys()}
+        return dict.fromkeys(output_types.keys())
 
     def to_dict(self):
         return default_to_dict(self)
 
-    def from_dict(cls, data: Dict[str, Any]):
+    def from_dict(cls, data: dict[str, Any]):
         return default_from_dict(cls, data)
 
     fields = {"__init__": init, "run": run, "to_dict": to_dict, "from_dict": classmethod(from_dict)}

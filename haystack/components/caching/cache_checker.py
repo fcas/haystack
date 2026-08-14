@@ -2,13 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import importlib
-from typing import Any, Dict, List
+from typing import Any
 
-from haystack import DeserializationError, Document, component, default_from_dict, default_to_dict, logging
+from haystack import Document, component, default_from_dict, default_to_dict
 from haystack.document_stores.types import DocumentStore
-
-logger = logging.getLogger(__name__)
 
 
 @component
@@ -16,10 +13,11 @@ class CacheChecker:
     """
     Checks for the presence of documents in a Document Store based on a specified field in each document's metadata.
 
-    If matching documents are found, they are returned as hits. If not, the items
-    are returned as misses, indicating they are not in the cache.
+    If matching documents are found, they are returned as "hits". If not found in the cache, the items
+    are returned as "misses".
 
-    Usage example:
+    ### Usage example
+
     ```python
     from haystack import Document
     from haystack.document_stores.in_memory import InMemoryDocumentStore
@@ -39,30 +37,30 @@ class CacheChecker:
     ```
     """
 
-    def __init__(self, document_store: DocumentStore, cache_field: str):
+    def __init__(self, document_store: DocumentStore, cache_field: str) -> None:
         """
-        Create a CacheChecker component.
+        Creates a CacheChecker component.
 
         :param document_store:
-            Document store to check.
+            Document Store to check for the presence of specific documents.
         :param cache_field:
-            Name of the Document metadata field
+            Name of the document's metadata field
             to check for cache hits.
         """
         self.document_store = document_store
         self.cache_field = cache_field
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """
         Serializes the component to a dictionary.
 
         :returns:
             Dictionary with serialized data.
         """
-        return default_to_dict(self, document_store=self.document_store.to_dict(), cache_field=self.cache_field)
+        return default_to_dict(self, document_store=self.document_store, cache_field=self.cache_field)
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "CacheChecker":
+    def from_dict(cls, data: dict[str, Any]) -> "CacheChecker":
         """
         Deserializes the component from a dictionary.
 
@@ -71,29 +69,10 @@ class CacheChecker:
         :returns:
             Deserialized component.
         """
-        init_params = data.get("init_parameters", {})
-        if "document_store" not in init_params:
-            raise DeserializationError("Missing 'document_store' in serialization data")
-        if "type" not in init_params["document_store"]:
-            raise DeserializationError("Missing 'type' in document store's serialization data")
-
-        try:
-            module_name, type_ = init_params["document_store"]["type"].rsplit(".", 1)
-            logger.debug("Trying to import module '{module_name}'", module_name=module_name)
-            module = importlib.import_module(module_name)
-        except (ImportError, DeserializationError) as e:
-            raise DeserializationError(
-                f"DocumentStore of type '{init_params['document_store']['type']}' not correctly imported"
-            ) from e
-
-        docstore_class = getattr(module, type_)
-        docstore = docstore_class.from_dict(init_params["document_store"])
-
-        data["init_parameters"]["document_store"] = docstore
         return default_from_dict(cls, data)
 
-    @component.output_types(hits=List[Document], misses=List)
-    def run(self, items: List[Any]):
+    @component.output_types(hits=list[Document], misses=list)
+    def run(self, items: list[Any]) -> dict[str, Any]:
         """
         Checks if any document associated with the specified cache field is already present in the store.
 
@@ -101,17 +80,58 @@ class CacheChecker:
             Values to be checked against the cache field.
         :return:
             A dictionary with two keys:
-            - `hits` - Documents that matched with any of the items.
+            - `hits` - Documents that matched with at least one of the items.
             - `misses` - Items that were not present in any documents.
         """
         found_documents = []
         misses = []
 
         for item in items:
-            filters = {self.cache_field: item}
+            filters = {"field": self.cache_field, "operator": "==", "value": item}
             found = self.document_store.filter_documents(filters=filters)
             if found:
                 found_documents.extend(found)
             else:
                 misses.append(item)
         return {"hits": found_documents, "misses": misses}
+
+    @component.output_types(hits=list[Document], misses=list)
+    async def run_async(self, items: list[Any]) -> dict[str, Any]:
+        """
+        Asynchronously checks if any document associated with the specified cache field is already present in the store.
+
+        :param items:
+            Values to be checked against the cache field.
+        :return:
+            A dictionary with two keys:
+            - `hits` - Documents that matched with at least one of the items.
+            - `misses` - Items that were not present in any documents.
+        """
+        found_documents = []
+        misses = []
+
+        if not hasattr(self.document_store, "filter_documents_async"):
+            raise TypeError(f"Document store {type(self.document_store).__name__} does not provide async support.")
+
+        for item in items:
+            filters = {"field": self.cache_field, "operator": "==", "value": item}
+            found = await self.document_store.filter_documents_async(filters=filters)
+            if found:
+                found_documents.extend(found)
+            else:
+                misses.append(item)
+        return {"hits": found_documents, "misses": misses}
+
+    def close(self) -> None:
+        """
+        Release the synchronous resources of the underlying Document Store.
+        """
+        if hasattr(self.document_store, "close"):
+            self.document_store.close()
+
+    async def close_async(self) -> None:
+        """
+        Release the asynchronous resources of the underlying Document Store.
+        """
+        if hasattr(self.document_store, "close_async"):
+            await self.document_store.close_async()

@@ -3,17 +3,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
-from haystack import logging
 from haystack.lazy_imports import LazyImport
 
-logger = logging.getLogger(__name__)
-
 with LazyImport(
-    message="PyTorch must be installed to use torch.device or use GPU support in HuggingFace transformers. Run 'pip install transformers[torch]'"
+    message="PyTorch must be installed to use torch.device or use GPU support in HuggingFace transformers. "
+    "Run 'pip install \"transformers[torch]\"'"
 ) as torch_import:
     import torch
 
@@ -30,8 +29,9 @@ class DeviceType(Enum):
     GPU = "cuda"
     DISK = "disk"
     MPS = "mps"
+    XPU = "xpu"
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.value
 
     @staticmethod
@@ -63,9 +63,9 @@ class Device:
     """
 
     type: DeviceType
-    id: Optional[int] = field(default=None)
+    id: int | None = field(default=None)
 
-    def __init__(self, type: DeviceType, id: Optional[int] = None):  # noqa:A002
+    def __init__(self, type: DeviceType, id: int | None = None) -> None:  # noqa:A002
         """
         Create a generic device.
 
@@ -80,11 +80,10 @@ class Device:
         self.type = type
         self.id = id
 
-    def __str__(self):
+    def __str__(self) -> str:
         if self.id is None:
             return str(self.type)
-        else:
-            return f"{self.type}:{self.id}"
+        return f"{self.type}:{self.id}"
 
     @staticmethod
     def cpu() -> "Device":
@@ -129,6 +128,16 @@ class Device:
         return Device(DeviceType.MPS)
 
     @staticmethod
+    def xpu() -> "Device":
+        """
+        Create a generic Intel GPU Optimization device.
+
+        :returns:
+            The XPU device.
+        """
+        return Device(DeviceType.XPU)
+
+    @staticmethod
     def from_str(string: str) -> "Device":
         """
         Create a generic device from a string.
@@ -153,12 +162,12 @@ class DeviceMap:
         Dictionary mapping strings to devices.
     """
 
-    mapping: Dict[str, Device] = field(default_factory=dict, hash=False)
+    mapping: dict[str, Device] = field(default_factory=dict, hash=False)
 
     def __getitem__(self, key: str) -> Device:
         return self.mapping[key]
 
-    def __setitem__(self, key: str, value: Device):
+    def __setitem__(self, key: str, value: Device) -> None:
         self.mapping[key] = value
 
     def __contains__(self, key: str) -> bool:
@@ -167,10 +176,10 @@ class DeviceMap:
     def __len__(self) -> int:
         return len(self.mapping)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[tuple[str, Device]]:
         return iter(self.mapping.items())
 
-    def to_dict(self) -> Dict[str, str]:
+    def to_dict(self) -> dict[str, str]:
         """
         Serialize the mapping to a JSON-serializable dictionary.
 
@@ -180,7 +189,7 @@ class DeviceMap:
         return {key: str(device) for key, device in self.mapping.items()}
 
     @property
-    def first_device(self) -> Optional[Device]:
+    def first_device(self) -> Device | None:
         """
         Return the first device in the mapping, if any.
 
@@ -189,11 +198,10 @@ class DeviceMap:
         """
         if not self.mapping:
             return None
-        else:
-            return next(iter(self.mapping.values()))
+        return next(iter(self.mapping.values()))
 
     @staticmethod
-    def from_dict(dict: Dict[str, str]) -> "DeviceMap":  # noqa:A002
+    def from_dict(dict: dict[str, str]) -> "DeviceMap":  # noqa:A002
         """
         Create a generic device map from a JSON-serialized dictionary.
 
@@ -208,7 +216,7 @@ class DeviceMap:
         return DeviceMap(mapping)
 
     @staticmethod
-    def from_hf(hf_device_map: Dict[str, Union[int, str, "torch.device"]]) -> "DeviceMap":
+    def from_hf(hf_device_map: dict[str, Union[int, str, "torch.device"]]) -> "DeviceMap":
         """
         Create a generic device map from a HuggingFace device map.
 
@@ -216,6 +224,7 @@ class DeviceMap:
             The HuggingFace device map.
         :returns:
             The deserialized device map.
+        :raises TypeError: If a device value in the map is not an int, str, or torch.device.
         """
         mapping = {}
         for key, device in hf_device_map.items():
@@ -229,7 +238,7 @@ class DeviceMap:
                 device_id = device.index
                 mapping[key] = Device(DeviceType.from_str(device_type), device_id)
             else:
-                raise ValueError(
+                raise TypeError(
                     f"Couldn't convert HuggingFace device map - unexpected device '{str(device)}' for '{key}'"
                 )
         return DeviceMap(mapping)
@@ -243,8 +252,8 @@ class ComponentDevice:
     This can be either a single device or a device map.
     """
 
-    _single_device: Optional[Device] = field(default=None)
-    _multiple_devices: Optional[DeviceMap] = field(default=None)
+    _single_device: Device | None = field(default=None)
+    _multiple_devices: DeviceMap | None = field(default=None)
 
     @classmethod
     def from_str(cls, device_str: str) -> "ComponentDevice":
@@ -290,7 +299,7 @@ class ComponentDevice:
         """
         return cls(_multiple_devices=device_map)
 
-    def _validate(self):
+    def _validate(self) -> None:
         """
         Validate the component device representation.
         """
@@ -352,10 +361,9 @@ class ComponentDevice:
         if self._single_device.type == DeviceType.GPU:
             assert self._single_device.id is not None
             return self._single_device.id
-        else:
-            return -1
+        return -1
 
-    def to_hf(self) -> Union[Union[int, str], Dict[str, Union[int, str]]]:
+    def to_hf(self) -> int | str | dict[str, int | str]:
         """
         Convert the component device representation to HuggingFace format.
 
@@ -364,12 +372,11 @@ class ComponentDevice:
         """
         self._validate()
 
-        def convert_device(device: Device, *, gpu_id_only: bool = False) -> Union[int, str]:
+        def convert_device(device: Device, *, gpu_id_only: bool = False) -> int | str:
             if gpu_id_only and device.type == DeviceType.GPU:
                 assert device.id is not None
                 return device.id
-            else:
-                return str(device)
+            return str(device)
 
         if self._single_device is not None:
             return convert_device(self._single_device)
@@ -377,7 +384,7 @@ class ComponentDevice:
         assert self._multiple_devices is not None
         return {key: convert_device(device, gpu_id_only=True) for key, device in self._multiple_devices.mapping.items()}
 
-    def update_hf_kwargs(self, hf_kwargs: Dict[str, Any], *, overwrite: bool) -> Dict[str, Any]:
+    def update_hf_kwargs(self, hf_kwargs: dict[str, Any], *, overwrite: bool) -> dict[str, Any]:
         """
         Convert the component device representation to HuggingFace format.
 
@@ -446,7 +453,7 @@ class ComponentDevice:
 
         return device
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """
         Convert the component device representation to a JSON-serializable dictionary.
 
@@ -455,14 +462,13 @@ class ComponentDevice:
         """
         if self._single_device is not None:
             return {"type": "single", "device": str(self._single_device)}
-        elif self._multiple_devices is not None:
+        if self._multiple_devices is not None:
             return {"type": "multiple", "device_map": self._multiple_devices.to_dict()}
-        else:
-            # Unreachable
-            assert False
+        # Unreachable
+        raise AssertionError()
 
     @classmethod
-    def from_dict(cls, dict: Dict[str, Any]) -> "ComponentDevice":  # noqa:A002
+    def from_dict(cls, dict: dict[str, Any]) -> "ComponentDevice":  # noqa:A002
         """
         Create a component device representation from a JSON-serialized dictionary.
 
@@ -473,10 +479,9 @@ class ComponentDevice:
         """
         if dict["type"] == "single":
             return cls.from_str(dict["device"])
-        elif dict["type"] == "multiple":
+        if dict["type"] == "multiple":
             return cls.from_multiple(DeviceMap.from_dict(dict["device_map"]))
-        else:
-            raise ValueError(f"Unknown component device type '{dict['type']}' in serialized data")
+        raise ValueError(f"Unknown component device type '{dict['type']}' in serialized data")
 
 
 def _get_default_device() -> Device:
@@ -484,7 +489,7 @@ def _get_default_device() -> Device:
     Return the default device for Haystack.
 
     Precedence:
-        GPU > MPS > CPU. If PyTorch is not installed, only CPU is available.
+        GPU > XPU > MPS > CPU. If PyTorch is not installed, only CPU is available.
 
     :returns:
         The default device.
@@ -498,19 +503,27 @@ def _get_default_device() -> Device:
             and os.getenv("HAYSTACK_MPS_ENABLED", "true") != "false"
         )
         has_cuda = torch.cuda.is_available()
+        has_xpu = (
+            hasattr(torch, "xpu")
+            and hasattr(torch.xpu, "is_available")
+            and torch.xpu.is_available()
+            and os.getenv("HAYSTACK_XPU_ENABLED", "true") != "false"
+        )
     except ImportError:
         has_mps = False
         has_cuda = False
+        has_xpu = False
 
     if has_cuda:
         return Device.gpu()
-    elif has_mps:
+    if has_xpu:
+        return Device.xpu()
+    if has_mps:
         return Device.mps()
-    else:
-        return Device.cpu()
+    return Device.cpu()
 
 
-def _split_device_string(string: str) -> Tuple[str, Optional[int]]:
+def _split_device_string(string: str) -> tuple[str, int | None]:
     """
     Split a device string into device type and device id.
 
@@ -523,8 +536,8 @@ def _split_device_string(string: str) -> Tuple[str, Optional[int]]:
         device_type, device_id_str = string.split(":")
         try:
             device_id = int(device_id_str)
-        except ValueError:
-            raise ValueError(f"Device id must be an integer, got {device_id_str}")
+        except ValueError as e:
+            raise ValueError(f"Device id must be an integer, got {device_id_str}") from e
     else:
         device_type = string
         device_id = None

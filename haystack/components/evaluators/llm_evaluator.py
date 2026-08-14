@@ -2,13 +2,24 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import json
-from typing import Any, Dict, List, Tuple, Type
+from typing import Any
 
-from haystack import component, default_from_dict, default_to_dict
+from tqdm import tqdm
+from tqdm.asyncio import tqdm as async_tqdm
+
+from haystack import component, default_from_dict, default_to_dict, logging
 from haystack.components.builders import PromptBuilder
-from haystack.components.generators import OpenAIGenerator
-from haystack.utils import Secret, deserialize_secrets_inplace
+from haystack.components.generators.chat.openai import OpenAIChatGenerator
+from haystack.components.generators.chat.types import ChatGenerator
+from haystack.components.generators.utils import _trace_chat_generator_run
+from haystack.core.serialization import component_to_dict
+from haystack.dataclasses.chat_message import ChatMessage
+from haystack.utils import deserialize_chatgenerator_inplace, deserialize_type, serialize_type
+from haystack.utils.misc import _parse_dict_from_json
+
+logger = logging.getLogger(__name__)
 
 
 @component
@@ -23,11 +34,10 @@ class LLMEvaluator:
 
     Usage example:
     ```python
-    from typing import List
     from haystack.components.evaluators import LLMEvaluator
     evaluator = LLMEvaluator(
         instructions="Is this answer problematic for children?",
-        inputs=[("predicted_answers", List[str])],
+        inputs=[("predicted_answers", list[str])],
         outputs=["score"],
         examples=[
             {"inputs": {"predicted_answers": "Damn, this is straight outta hell!!!"}, "outputs": {"score": 1}},
@@ -47,15 +57,18 @@ class LLMEvaluator:
     def __init__(
         self,
         instructions: str,
-        inputs: List[Tuple[str, Type[List]]],
-        outputs: List[str],
-        examples: List[Dict[str, Any]],
+        inputs: list[tuple[str, type[list]]],
+        outputs: list[str],
+        examples: list[dict[str, Any]],
+        progress_bar: bool = True,
         *,
-        api: str = "openai",
-        api_key: Secret = Secret.from_env_var("OPENAI_API_KEY"),
-    ):
+        raise_on_failure: bool = True,
+        chat_generator: ChatGenerator | None = None,
+    ) -> None:
         """
         Creates an instance of LLMEvaluator.
+
+        If no LLM is specified using the `chat_generator` parameter, the component will use OpenAI in JSON mode.
 
         :param instructions:
             The prompt instructions to use for evaluation.
@@ -70,37 +83,71 @@ class LLMEvaluator:
              `outputs` parameters.
             Each example is a dictionary with keys "inputs" and "outputs"
             They contain the input and output as dictionaries respectively.
-        :param api:
-            The API to use for calling an LLM through a Generator.
-            Supported APIs: "openai".
-        :param api_key:
-            The API key.
-
+        :param raise_on_failure:
+            If True, the component will raise an exception on an unsuccessful API call.
+        :param progress_bar:
+            Whether to show a progress bar during the evaluation.
+        :param chat_generator:
+            a ChatGenerator instance which represents the LLM.
+            In order for the component to work, the LLM should be configured to return a JSON object. For example,
+            when using the OpenAIChatGenerator, you should pass `{"response_format": {"type": "json_object"}}` in the
+            `generation_kwargs`.
         """
         self.validate_init_parameters(inputs, outputs, examples)
+        component.set_input_types(self, **dict(inputs))
 
+        self.raise_on_failure = raise_on_failure
         self.instructions = instructions
         self.inputs = inputs
         self.outputs = outputs
         self.examples = examples
-        self.api = api
-        self.api_key = api_key
-
-        if api == "openai":
-            self.generator = OpenAIGenerator(
-                api_key=api_key, generation_kwargs={"response_format": {"type": "json_object"}}
-            )
-        else:
-            raise ValueError(f"Unsupported API: {api}")
+        self.progress_bar = progress_bar
 
         template = self.prepare_template()
         self.builder = PromptBuilder(template=template)
 
-        component.set_input_types(self, **dict(inputs))
+        if chat_generator is not None:
+            self._chat_generator = chat_generator
+        else:
+            generation_kwargs = {"response_format": {"type": "json_object"}, "seed": 42}
+            self._chat_generator = OpenAIChatGenerator(generation_kwargs=generation_kwargs)
 
+    def warm_up(self) -> None:
+        """
+        Warm up the underlying chat generator.
+        """
+        if hasattr(self._chat_generator, "warm_up"):
+            self._chat_generator.warm_up()
+
+    async def warm_up_async(self) -> None:
+        """
+        Warm up the underlying chat generator on the serving event loop.
+        """
+        if hasattr(self._chat_generator, "warm_up_async"):
+            await self._chat_generator.warm_up_async()
+        elif hasattr(self._chat_generator, "warm_up"):
+            self._chat_generator.warm_up()
+
+    def close(self) -> None:
+        """
+        Release the underlying chat generator's resources.
+        """
+        if hasattr(self._chat_generator, "close"):
+            self._chat_generator.close()
+
+    async def close_async(self) -> None:
+        """
+        Release the underlying chat generator's async resources.
+        """
+        if hasattr(self._chat_generator, "close_async"):
+            await self._chat_generator.close_async()
+        elif hasattr(self._chat_generator, "close"):
+            self._chat_generator.close()
+
+    @staticmethod
     def validate_init_parameters(
-        self, inputs: List[Tuple[str, Type[List]]], outputs: List[str], examples: List[Dict[str, Any]]
-    ):
+        inputs: list[tuple[str, type[list]]], outputs: list[str], examples: list[dict[str, Any]]
+    ) -> None:
         """
         Validate the init parameters.
 
@@ -152,35 +199,150 @@ class LLMEvaluator:
                 )
                 raise ValueError(msg)
 
-    @component.output_types(results=List[Dict[str, Any]])
-    def run(self, **inputs) -> Dict[str, Any]:
+    @component.output_types(results=list[dict[str, Any]], meta=list[dict[str, Any]] | None)
+    def run(self, **inputs: Any) -> dict[str, Any]:
         """
         Run the LLM evaluator.
 
         :param inputs:
             The input values to evaluate. The keys are the input names and the values are lists of input values.
         :returns:
-            A dictionary with a single `results` entry that contains a list of results.
+            A dictionary with a `results` entry that contains a list of results.
             Each result is a dictionary containing the keys as defined in the `outputs` parameter of the LLMEvaluator
-            and the evaluation results as the values.
+            and the evaluation results as the values. If an exception occurs for a particular input value, the result
+            will be `None` for that entry.
+            If the API is "openai" and the response contains a "meta" key, the metadata from OpenAI will be included
+            in the output dictionary, under the key "meta".
+        :raises ValueError:
+            Only in the case that  `raise_on_failure` is set to True and the received inputs are not lists or have
+            different lengths, or if the output is not a valid JSON or doesn't contain the expected keys.
         """
+        self.warm_up()
+
         self.validate_input_parameters(dict(self.inputs), inputs)
 
         # inputs is a dictionary with keys being input names and values being a list of input values
         # We need to iterate through the lists in parallel for all keys of the dictionary
-        input_names, values = inputs.keys(), list(zip(*inputs.values()))
-        list_of_input_names_to_values = [dict(zip(input_names, v)) for v in values]
+        input_names, values = inputs.keys(), list(zip(*inputs.values(), strict=True))
+        list_of_input_names_to_values = [dict(zip(input_names, v, strict=True)) for v in values]
 
-        results = []
-        for input_names_to_values in list_of_input_names_to_values:
+        results: list[dict[str, Any] | None] = []
+        metadata = []
+        errors = 0
+        for input_names_to_values in tqdm(list_of_input_names_to_values, disable=not self.progress_bar):
             prompt = self.builder.run(**input_names_to_values)
-            result = self.generator.run(prompt=prompt["prompt"])
+            messages = [ChatMessage.from_user(prompt["prompt"])]
+            try:
+                with _trace_chat_generator_run(self._chat_generator, {"messages": messages}) as span:
+                    result = self._chat_generator.run(messages=messages)
+                    span.set_content_tag("haystack.component.output", result)
+            except Exception as e:
+                if self.raise_on_failure:
+                    raise ValueError(f"Error while generating response for prompt: {prompt}. Error: {e}") from e
+                logger.warning("Error while generating response for prompt: {prompt}. Error: {e}", prompt=prompt, e=e)
+                results.append(None)
+                errors += 1
+                continue
 
-            self.validate_outputs(expected=self.outputs, received=result["replies"][0])
-            parsed_result = json.loads(result["replies"][0])
-            results.append(parsed_result)
+            parsed_result = _parse_dict_from_json(
+                result["replies"][0].text, expected_keys=self.outputs, raise_on_failure=self.raise_on_failure
+            )
+            if parsed_result is None:
+                results.append(None)
+                errors += 1
+            else:
+                results.append(parsed_result)
 
-        return {"results": results}
+            if result["replies"][0].meta:
+                metadata.append(result["replies"][0].meta)
+
+        if errors > 0:
+            logger.warning(
+                "LLM evaluator failed for {errors} out of {len(list_of_input_names_to_values)} inputs.",
+                errors=errors,
+                len=len(list_of_input_names_to_values),
+            )
+
+        return {"results": results, "meta": metadata or None}
+
+    @component.output_types(results=list[dict[str, Any]], meta=list[dict[str, Any]] | None)
+    async def run_async(self, **inputs: Any) -> dict[str, Any]:
+        """
+        Run the LLM evaluator asynchronously
+
+        :param inputs:
+            The input values to evaluate. The keys are the input names and the values are lists of input values.
+        :returns:
+            A dictionary with a `results` entry that contains a list of results.
+            Each result is a dictionary containing the keys as defined in the `outputs` parameter of the LLMEvaluator
+            and the evaluation results as the values. If an exception occurs for a particular input value, the result
+            will be `None` for that entry.
+            If the API is "openai" and the response contains a "meta" key, the metadata from OpenAI will be included
+            in the output dictionary, under the key "meta".
+        :raises TypeError:
+            If the chat generator does not support async execution.
+        :raises ValueError:
+            Only in the case that  `raise_on_failure` is set to True and the received inputs are not lists or have
+            different lengths, or if the output is not a valid JSON or doesn't contain the expected keys.
+        """
+
+        await self.warm_up_async()
+
+        self.validate_input_parameters(dict(self.inputs), inputs)
+
+        # inputs is a dictionary with keys being input names and values being a list of input values
+        # We need to iterate through the lists in parallel for all keys of the dictionary
+        input_names, values = inputs.keys(), list(zip(*inputs.values(), strict=True))
+        list_of_input_names_to_values = [dict(zip(input_names, v, strict=True)) for v in values]
+
+        results: list[dict[str, Any] | None] = []
+        metadata = []
+        errors = 0
+
+        generator_has_async = hasattr(self._chat_generator, "run_async")
+        for input_names_to_values in async_tqdm(list_of_input_names_to_values, disable=not self.progress_bar):
+            prompt = self.builder.run(**input_names_to_values)
+            messages = [ChatMessage.from_user(prompt["prompt"])]
+            try:
+                with _trace_chat_generator_run(self._chat_generator, {"messages": messages}) as span:
+                    if generator_has_async:
+                        result = await self._chat_generator.run_async(messages=messages)  # type: ignore[attr-defined]
+                    else:
+                        logger.debug(
+                            "{generator_type} does not implement 'run_async'."
+                            " Running the synchronous 'run' method in a thread to avoid blocking the event loop.",
+                            generator_type=type(self._chat_generator).__name__,
+                        )
+                        result = await asyncio.to_thread(self._chat_generator.run, messages=messages)
+                    span.set_content_tag("haystack.component.output", result)
+            except Exception as e:
+                if self.raise_on_failure:
+                    raise ValueError(f"Error while generating response for prompt: {prompt}. Error: {e}") from e
+                logger.warning("Error while generating response for prompt: {prompt}. Error: {e}", prompt=prompt, e=e)
+                results.append(None)
+                errors += 1
+                continue
+
+            parsed_result = _parse_dict_from_json(
+                result["replies"][0].text, expected_keys=self.outputs, raise_on_failure=self.raise_on_failure
+            )
+            if parsed_result is None:
+                results.append(None)
+                errors += 1
+            else:
+                results.append(parsed_result)
+
+            if result["replies"][0].meta:
+                metadata.append(result["replies"][0].meta)
+
+        if errors > 0:
+            logger.warning(
+                "LLM evaluator failed for {errors} out of {len(list_of_input_names_to_values)} inputs.",
+                errors=errors,
+                len=len(list_of_input_names_to_values),
+            )
+
+        return {"results": results, "meta": metadata or None}
 
     def prepare_template(self) -> str:
         """
@@ -188,17 +350,17 @@ class LLMEvaluator:
 
         Combine instructions, inputs, outputs, and examples into one prompt template with the following format:
         Instructions:
-        <instructions>
+        `<instructions>`
 
         Generate the response in JSON format with the following keys:
-        <list of output keys>
+        `<list of output keys>`
         Consider the instructions and the examples below to determine those values.
 
         Examples:
-        <examples>
+        `<examples>`
 
         Inputs:
-        <inputs>
+        `<inputs>`
         Outputs:
 
         :returns:
@@ -227,25 +389,28 @@ class LLMEvaluator:
             f"Outputs:\n"
         )
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """
         Serialize this component to a dictionary.
 
         :returns:
             The serialized component as a dictionary.
         """
+        # Since we cannot currently serialize tuples, convert the inputs to a list.
+        inputs = [[name, serialize_type(type_)] for name, type_ in self.inputs]
         return default_to_dict(
             self,
             instructions=self.instructions,
-            inputs=self.inputs,
+            inputs=inputs,
             outputs=self.outputs,
             examples=self.examples,
-            api=self.api,
-            api_key=self.api_key.to_dict(),
+            chat_generator=component_to_dict(obj=self._chat_generator, name="chat_generator"),
+            progress_bar=self.progress_bar,
+            raise_on_failure=self.raise_on_failure,
         )
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "LLMEvaluator":
+    def from_dict(cls, data: dict[str, Any]) -> "LLMEvaluator":
         """
         Deserialize this component from a dictionary.
 
@@ -254,11 +419,17 @@ class LLMEvaluator:
         :returns:
             The deserialized component instance.
         """
-        deserialize_secrets_inplace(data["init_parameters"], keys=["api_key"])
+        data["init_parameters"]["inputs"] = [
+            (name, deserialize_type(type_)) for name, type_ in data["init_parameters"]["inputs"]
+        ]
+
+        if data["init_parameters"].get("chat_generator"):
+            deserialize_chatgenerator_inplace(data["init_parameters"], key="chat_generator")
+
         return default_from_dict(cls, data)
 
     @staticmethod
-    def validate_input_parameters(expected: Dict[str, Any], received: Dict[str, Any]) -> None:
+    def validate_input_parameters(expected: dict[str, Any], received: dict[str, Any]) -> None:
         """
         Validate the input parameters.
 
@@ -272,14 +443,17 @@ class LLMEvaluator:
             If the received inputs are not lists or have different lengths
         """
         # Validate that all expected inputs are present in the received inputs
-        for param in expected.keys():
+        for param in expected:
             if param not in received:
                 msg = f"LLM evaluator expected input parameter '{param}' but received only {received.keys()}."
                 raise ValueError(msg)
 
         # Validate that all received inputs are lists
         if not all(isinstance(_input, list) for _input in received.values()):
-            msg = f"LLM evaluator expects all input values to be lists but received {[type(_input) for _input in received.values()]}."
+            msg = (
+                "LLM evaluator expects all input values to be lists but received "
+                f"{[type(_input) for _input in received.values()]}."
+            )
             raise ValueError(msg)
 
         # Validate that all received inputs are of the same length
@@ -290,22 +464,4 @@ class LLMEvaluator:
                 f"LLM evaluator expects all input lists to have the same length but received {inputs} with lengths "
                 f"{[len(_input) for _input in inputs]}."
             )
-            raise ValueError(msg)
-
-    @staticmethod
-    def validate_outputs(expected: List[str], received: str) -> None:
-        """
-        Validate the output.
-
-        :param expected:
-            Names of expected outputs
-        :param received:
-            Names of received outputs
-
-        :raises ValueError:
-            If not all expected outputs are present in the received outputs
-        """
-        parsed_output = json.loads(received)
-        if not all(output in parsed_output for output in expected):
-            msg = f"Expected response from LLM evaluator to be JSON with keys {expected}, got {received}."
             raise ValueError(msg)

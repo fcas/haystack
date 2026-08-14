@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
 #
 # SPDX-License-Identifier: Apache-2.0
-import logging
+
 from functools import partial
 from typing import Any
 
@@ -9,7 +9,6 @@ import pytest
 
 from haystack.core.component import Component, InputSocket, OutputSocket, component
 from haystack.core.component.component import _hook_component_init
-from haystack.core.component.types import Variadic
 from haystack.core.errors import ComponentError
 from haystack.core.pipeline import Pipeline
 
@@ -25,12 +24,39 @@ def test_correct_declaration():
             return cls()
 
         @component.output_types(output_value=int)
-        def run(self, input_value: int):
+        def run(self, input_value: int) -> dict[str, int]:
             return {"output_value": input_value}
 
     # Verifies also instantiation works with no issues
     assert MockComponent()
     assert component.registry["test_component.MockComponent"] == MockComponent
+    assert isinstance(MockComponent(), Component)
+    assert MockComponent().__haystack_supports_async__ is False  # type: ignore[attr-defined]
+
+
+def test_correct_declaration_with_async():
+    @component
+    class MockComponent:
+        def to_dict(self):
+            return {}
+
+        @classmethod
+        def from_dict(cls, data):
+            return cls()
+
+        @component.output_types(output_value=int)
+        def run(self, input_value: int) -> dict[str, int]:
+            return {"output_value": input_value}
+
+        @component.output_types(output_value=int)
+        async def run_async(self, input_value: int) -> dict[str, int]:
+            return {"output_value": input_value}
+
+    # Verifies also instantiation works with no issues
+    assert MockComponent()
+    assert component.registry["test_component.MockComponent"] == MockComponent
+    assert isinstance(MockComponent(), Component)
+    assert MockComponent().__haystack_supports_async__ is True  # type: ignore[attr-defined]
 
 
 def test_correct_declaration_with_additional_readonly_property():
@@ -48,7 +74,7 @@ def test_correct_declaration_with_additional_readonly_property():
             return cls()
 
         @component.output_types(output_value=int)
-        def run(self, input_value: int):
+        def run(self, input_value: int) -> dict[str, int]:
             return {"output_value": input_value}
 
     # Verifies that instantiation works with no issues
@@ -76,7 +102,7 @@ def test_correct_declaration_with_additional_writable_property():
             return cls()
 
         @component.output_types(output_value=int)
-        def run(self, input_value: int):
+        def run(self, input_value: int) -> dict[str, int]:
             return {"output_value": input_value}
 
     # Verifies that instantiation works with no issues
@@ -90,31 +116,156 @@ def test_missing_run():
     with pytest.raises(ComponentError, match=r"must have a 'run\(\)' method"):
 
         @component
-        class MockComponent:
-            def another_method(self, input_value: int):
+        class MockComponent:  # type: ignore[type-var]
+            def another_method(self, input_value: int) -> dict[str, int]:
                 return {"output_value": input_value}
+
+
+def test_async_run_not_async():
+    @component
+    class MockComponent:
+        @component.output_types(value=int)
+        def run(self, value: int) -> dict[str, int]:
+            return {"value": 1}
+
+        @component.output_types(value=int)
+        def run_async(self, value: int) -> dict[str, int]:
+            return {"value": 1}
+
+    with pytest.raises(ComponentError, match=r"must be a coroutine"):
+        _ = MockComponent()
+
+
+def test_async_run_not_coroutine():
+    @component
+    class MockComponent:
+        @component.output_types(value=int)
+        def run(self, value: int) -> dict[str, int]:
+            return {"value": 1}
+
+        @component.output_types(value=int)
+        async def run_async(self, value: int) -> dict[str, int]:  # type: ignore[misc]
+            yield {"value": 1}
+
+    with pytest.raises(ComponentError, match=r"must be a coroutine"):
+        _ = MockComponent()
+
+
+def test_parameters_mismatch_run_and_async_run():
+    err_msg = r"Parameters of 'run' and 'run_async' methods must be the same"
+
+    @component
+    class MockComponentMismatchingInputTypes:
+        @component.output_types(value=int)
+        def run(self, value: int) -> dict[str, int]:
+            return {"value": 1}
+
+        @component.output_types(value=int)
+        async def run_async(self, value: str) -> dict[str, int]:
+            return {"value": 1}
+
+    with pytest.raises(ComponentError, match=err_msg):
+        _ = MockComponentMismatchingInputTypes()
+
+    @component
+    class MockComponentMismatchingInputs:
+        @component.output_types(value=int)
+        def run(self, value: int, **kwargs: Any) -> dict[str, int]:
+            return {"value": 1}
+
+        @component.output_types(value=int)
+        async def run_async(self, value: int) -> dict[str, int]:
+            return {"value": 1}
+
+    with pytest.raises(ComponentError, match=err_msg):
+        _ = MockComponentMismatchingInputs()
+
+    @component
+    class MockComponentMismatchingInputOrder:
+        @component.output_types(value=int)
+        def run(self, value: int, another: str) -> dict[str, int]:
+            return {"value": 1}
+
+        @component.output_types(value=int)
+        async def run_async(self, another: str, value: int) -> dict[str, int]:
+            return {"value": 1}
+
+    with pytest.raises(ComponentError, match=err_msg):
+        _ = MockComponentMismatchingInputOrder()
 
 
 def test_set_input_types():
     @component
     class MockComponent:
-        def __init__(self):
+        def __init__(self, flag: bool):
             component.set_input_types(self, value=Any)
-
-        def to_dict(self):
-            return {}
-
-        @classmethod
-        def from_dict(cls, data):
-            return cls()
+            if flag:
+                component.set_input_type(self, name="another", type=str)
 
         @component.output_types(value=int)
         def run(self, **kwargs):
             return {"value": 1}
 
-    comp = MockComponent()
-    assert comp.__haystack_input__._sockets_dict == {"value": InputSocket("value", Any)}
+    comp = MockComponent(False)
+    assert comp.__haystack_input__._sockets_dict == {"value": InputSocket("value", Any)}  # type: ignore[attr-defined]
     assert comp.run() == {"value": 1}
+
+    comp = MockComponent(True)
+    assert comp.__haystack_input__._sockets_dict == {  # type: ignore[attr-defined]
+        "value": InputSocket("value", Any),
+        "another": InputSocket("another", str),
+    }
+    assert comp.run() == {"value": 1}
+
+
+def test_set_input_types_no_kwarg():
+    @component
+    class MockComponent:
+        def __init__(self, flag: bool):
+            if flag:
+                component.set_input_type(self, name="another", type=str)
+            else:
+                component.set_input_types(self, value=Any)
+
+        @component.output_types(value=int)
+        def run(self, fini: bool) -> dict[str, int]:
+            return {"value": 1}
+
+    with pytest.raises(ComponentError, match=r"doesn't have a kwargs parameter"):
+        _ = MockComponent(False)
+
+    with pytest.raises(ComponentError, match=r"doesn't have a kwargs parameter"):
+        _ = MockComponent(True)
+
+
+def test_set_input_types_overrides_run():
+    @component
+    class MockComponent:
+        def __init__(self, state: bool):
+            if state:
+                component.set_input_type(self, name="fini", type=str)
+            else:
+                component.set_input_types(self, fini=Any)
+
+        @component.output_types(value=int)
+        def run(self, fini: bool, **kwargs: Any) -> dict[str, int]:
+            return {"value": 1}
+
+    err_msg = "cannot override the parameters of the 'run' method"
+    with pytest.raises(ComponentError, match=err_msg):
+        _ = MockComponent(False)
+
+    with pytest.raises(ComponentError, match=err_msg):
+        _ = MockComponent(True)
+
+
+def test_set_input_types_postponed_annotations():
+    # The component HelloUsingFutureAnnotations must live in a different module than the one where the test is defined,
+    # so we can properly set up postponed evaluation of annotations using `from __future__ import annotations`.
+    # For this reason, we define it in haystack.testing.sample_components.future_annotations and import it here.
+    from haystack.testing.sample_components import HelloUsingFutureAnnotations
+
+    assert HelloUsingFutureAnnotations().__haystack_input__._sockets_dict == {"word": InputSocket("word", str)}  # type: ignore[attr-defined]
 
 
 def test_set_output_types():
@@ -130,43 +281,120 @@ def test_set_output_types():
         def from_dict(cls, data):
             return cls()
 
-        def run(self, value: int):
+        def run(self, value: int) -> dict[str, int]:
             return {"value": 1}
 
     comp = MockComponent()
-    assert comp.__haystack_output__._sockets_dict == {"value": OutputSocket("value", int)}
+    assert comp.__haystack_output__._sockets_dict == {"value": OutputSocket("value", int)}  # type: ignore[attr-defined]
 
 
 def test_output_types_decorator_with_compatible_type():
     @component
     class MockComponent:
         @component.output_types(value=int)
-        def run(self, value: int):
+        def run(self, value: int) -> dict[str, int]:
             return {"value": 1}
 
-        def to_dict(self):
+        def to_dict(self) -> dict:
             return {}
 
         @classmethod
-        def from_dict(cls, data):
+        def from_dict(cls, data: dict) -> "MockComponent":
             return cls()
 
     comp = MockComponent()
-    assert comp.__haystack_output__._sockets_dict == {"value": OutputSocket("value", int)}
+    assert comp.__haystack_output__._sockets_dict == {"value": OutputSocket("value", int)}  # type: ignore[attr-defined]
+
+
+def test_output_types_decorator_wrong_method():
+    with pytest.raises(ComponentError):
+
+        @component
+        class MockComponent:
+            def run(self, value: int) -> dict[str, int]:
+                return {"value": 1}
+
+            @component.output_types(value=int)
+            def to_dict(self):
+                return {}
+
+            @classmethod
+            def from_dict(cls, data):
+                return cls()
+
+
+def test_output_types_decorator_and_set_output_types():
+    @component
+    class MockComponent:
+        def __init__(self) -> None:
+            component.set_output_types(self, value=int)
+
+        @component.output_types(value=int)
+        def run(self, value: int) -> dict[str, int]:
+            return {"value": 1}
+
+    with pytest.raises(ComponentError, match="Cannot call `set_output_types`"):
+        _ = MockComponent()
+
+
+def test_output_types_decorator_and_set_output_types_async():
+    @component
+    class MockComponent:
+        def __init__(self) -> None:
+            component.set_output_types(self, value=int)
+
+        def run(self, value: int) -> dict[str, int]:
+            return {"value": 1}
+
+        @component.output_types(value=int)
+        async def run_async(self, value: int) -> dict[str, int]:
+            return {"value": 1}
+
+    with pytest.raises(ComponentError, match="Cannot call `set_output_types`"):
+        _ = MockComponent()
+
+
+def test_output_types_decorator_mismatch_run_async_run():
+    @component
+    class MockComponent:
+        @component.output_types(value=int)
+        def run(self, value: int) -> dict[str, str]:
+            return {"value": "1"}
+
+        @component.output_types(value=str)
+        async def run_async(self, value: int) -> dict[str, str]:
+            return {"value": "1"}
+
+    with pytest.raises(ComponentError, match=r"Output type specifications .* must be the same"):
+        _ = MockComponent()
+
+
+def test_output_types_decorator_missing_async_run():
+    @component
+    class MockComponent:
+        @component.output_types(value=int)
+        def run(self, value: int) -> dict[str, int]:
+            return {"value": 1}
+
+        async def run_async(self, value: int) -> dict[str, int]:
+            return {"value": 1}
+
+    with pytest.raises(ComponentError, match=r"Output type specifications .* must be the same"):
+        _ = MockComponent()
 
 
 def test_component_decorator_set_it_as_component():
     @component
     class MockComponent:
         @component.output_types(value=int)
-        def run(self, value: int):
+        def run(self, value: int) -> dict[str, int]:
             return {"value": 1}
 
-        def to_dict(self):
+        def to_dict(self) -> dict:
             return {}
 
         @classmethod
-        def from_dict(cls, data):
+        def from_dict(cls, data: dict) -> "MockComponent":
             return cls()
 
     comp = MockComponent()
@@ -177,12 +405,12 @@ def test_input_has_default_value():
     @component
     class MockComponent:
         @component.output_types(value=int)
-        def run(self, value: int = 42):
+        def run(self, value: int = 42) -> dict[str, int]:
             return {"value": value}
 
     comp = MockComponent()
-    assert comp.__haystack_input__._sockets_dict["value"].default_value == 42
-    assert not comp.__haystack_input__._sockets_dict["value"].is_mandatory
+    assert comp.__haystack_input__._sockets_dict["value"].default_value == 42  # type: ignore[attr-defined]
+    assert not comp.__haystack_input__._sockets_dict["value"].is_mandatory  # type: ignore[attr-defined]
 
 
 def test_keyword_only_args():
@@ -191,11 +419,14 @@ def test_keyword_only_args():
         def __init__(self):
             component.set_output_types(self, value=int)
 
-        def run(self, *, arg: int):
+        def run(self, *, arg: int) -> dict[str, int]:
             return {"value": arg}
 
     comp = MockComponent()
-    component_inputs = {name: {"type": socket.type} for name, socket in comp.__haystack_input__._sockets_dict.items()}
+    component_inputs = {
+        name: {"type": socket.type}
+        for name, socket in comp.__haystack_input__._sockets_dict.items()  # type: ignore[attr-defined]
+    }
     assert component_inputs == {"arg": {"type": int}}
 
 
@@ -205,7 +436,7 @@ def test_repr():
         def __init__(self):
             component.set_output_types(self, value=int)
 
-        def run(self, value: int):
+        def run(self, value: int) -> dict[str, int]:
             return {"value": value}
 
     comp = MockComponent()
@@ -218,64 +449,13 @@ def test_repr_added_to_pipeline():
         def __init__(self):
             component.set_output_types(self, value=int)
 
-        def run(self, value: int):
+        def run(self, value: int) -> dict[str, int]:
             return {"value": value}
 
     pipe = Pipeline()
     comp = MockComponent()
     pipe.add_component("my_component", comp)
     assert repr(comp) == f"{object.__repr__(comp)}\nmy_component\nInputs:\n  - value: int\nOutputs:\n  - value: int"
-
-
-def test_is_greedy_default_with_variadic_input():
-    @component
-    class MockComponent:
-        @component.output_types(value=int)
-        def run(self, value: Variadic[int]):
-            return {"value": value}
-
-    assert not MockComponent.__haystack_is_greedy__
-    assert not MockComponent().__haystack_is_greedy__
-
-
-def test_is_greedy_default_without_variadic_input():
-    @component
-    class MockComponent:
-        @component.output_types(value=int)
-        def run(self, value: int):
-            return {"value": value}
-
-    assert not MockComponent.__haystack_is_greedy__
-    assert not MockComponent().__haystack_is_greedy__
-
-
-def test_is_greedy_flag_with_variadic_input():
-    @component(is_greedy=True)
-    class MockComponent:
-        @component.output_types(value=int)
-        def run(self, value: Variadic[int]):
-            return {"value": value}
-
-    assert MockComponent.__haystack_is_greedy__
-    assert MockComponent().__haystack_is_greedy__
-
-
-def test_is_greedy_flag_without_variadic_input(caplog):
-    caplog.set_level(logging.WARNING)
-
-    @component(is_greedy=True)
-    class MockComponent:
-        @component.output_types(value=int)
-        def run(self, value: int):
-            return {"value": value}
-
-    assert MockComponent.__haystack_is_greedy__
-    assert caplog.text == ""
-    assert MockComponent().__haystack_is_greedy__
-    assert (
-        "Component 'MockComponent' has no variadic input, but it's marked as greedy."
-        " This is not supported and can lead to unexpected behavior.\n" in caplog.text
-    )
 
 
 def test_pre_init_hooking():
@@ -289,7 +469,7 @@ def test_pre_init_hooking():
             self.kwarg2 = kwarg2
 
         @component.output_types(output_value=int)
-        def run(self, input_value: int):
+        def run(self, input_value: int) -> dict[str, int]:
             return {"output_value": input_value}
 
     def pre_init_hook(component_class, init_params, expected_params):
@@ -332,7 +512,7 @@ def test_pre_init_hooking_variadic_positional_args():
             self.kwarg2 = kwarg2
 
         @component.output_types(output_value=int)
-        def run(self, input_value: int):
+        def run(self, input_value: int) -> dict[str, int]:
             return {"output_value": input_value}
 
     def pre_init_hook(component_class, init_params, expected_params):
@@ -344,8 +524,9 @@ def test_pre_init_hooking_variadic_positional_args():
     assert c.kwarg1 is None
     assert c.kwarg2 == "string"
 
-    with pytest.raises(ComponentError), _hook_component_init(
-        partial(pre_init_hook, expected_params={"args": (1, 2), "kwarg1": None})
+    with (
+        pytest.raises(ComponentError),
+        _hook_component_init(partial(pre_init_hook, expected_params={"args": (1, 2), "kwarg1": None})),
     ):
         _ = MockComponent(1, 2, kwarg1=None)
 
@@ -359,7 +540,7 @@ def test_pre_init_hooking_variadic_kwargs():
             self.kwargs = kwargs
 
         @component.output_types(output_value=int)
-        def run(self, input_value: int):
+        def run(self, input_value: int) -> dict[str, int]:
             return {"output_value": input_value}
 
     def pre_init_hook(component_class, init_params, expected_params):

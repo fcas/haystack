@@ -2,18 +2,15 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from haystack.components.generators.openai import (  # noqa: I001 (otherwise we end up with partial imports)
-    OpenAIGenerator,
-)
-from haystack.components.generators.azure import AzureOpenAIGenerator
-from haystack.components.generators.hugging_face_local import HuggingFaceLocalGenerator
-from haystack.components.generators.hugging_face_tgi import HuggingFaceTGIGenerator
-from haystack.components.generators.hugging_face_api import HuggingFaceAPIGenerator
+import sys
+from typing import TYPE_CHECKING
 
-__all__ = [
-    "HuggingFaceLocalGenerator",
-    "HuggingFaceTGIGenerator",
-    "HuggingFaceAPIGenerator",
-    "OpenAIGenerator",
-    "AzureOpenAIGenerator",
-]
+from lazy_imports import LazyImporter
+
+_import_structure = {"openai_image_generator": ["OpenAIImageGenerator"]}
+
+if TYPE_CHECKING:
+    from .openai_image_generator import OpenAIImageGenerator as OpenAIImageGenerator
+
+else:
+    sys.modules[__name__] = LazyImporter(name=__name__, module_file=__file__, import_structure=_import_structure)

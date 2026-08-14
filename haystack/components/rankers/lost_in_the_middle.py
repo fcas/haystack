@@ -2,9 +2,9 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Dict, List, Optional
 
 from haystack import Document, component
+from haystack.utils.misc import _deduplicate_documents
 
 
 @component
@@ -37,7 +37,7 @@ class LostInTheMiddleRanker:
     ```
     """
 
-    def __init__(self, word_count_threshold: Optional[int] = None, top_k: Optional[int] = None):
+    def __init__(self, word_count_threshold: int | None = None, top_k: int | None = None) -> None:
         """
         Initialize the LostInTheMiddleRanker.
 
@@ -51,7 +51,7 @@ class LostInTheMiddleRanker:
         """
         if isinstance(word_count_threshold, int) and word_count_threshold <= 0:
             raise ValueError(
-                f"Invalid value for word_count_threshold: {word_count_threshold}. " f"word_count_threshold must be > 0."
+                f"Invalid value for word_count_threshold: {word_count_threshold}. word_count_threshold must be > 0."
             )
         if isinstance(top_k, int) and top_k <= 0:
             raise ValueError(f"top_k must be > 0, but got {top_k}")
@@ -59,12 +59,15 @@ class LostInTheMiddleRanker:
         self.word_count_threshold = word_count_threshold
         self.top_k = top_k
 
-    @component.output_types(documents=List[Document])
+    @component.output_types(documents=list[Document])
     def run(
-        self, documents: List[Document], top_k: Optional[int] = None, word_count_threshold: Optional[int] = None
-    ) -> Dict[str, List[Document]]:
+        self, documents: list[Document], top_k: int | None = None, word_count_threshold: int | None = None
+    ) -> dict[str, list[Document]]:
         """
         Reranks documents based on the "lost in the middle" order.
+
+        Before ranking, documents are deduplicated by their id, retaining only the document with the highest score
+        if a score is present.
 
         :param documents: List of Documents to reorder.
         :param top_k: The maximum number of documents to return.
@@ -78,7 +81,7 @@ class LostInTheMiddleRanker:
         """
         if isinstance(word_count_threshold, int) and word_count_threshold <= 0:
             raise ValueError(
-                f"Invalid value for word_count_threshold: {word_count_threshold}. " f"word_count_threshold must be > 0."
+                f"Invalid value for word_count_threshold: {word_count_threshold}. word_count_threshold must be > 0."
             )
         if isinstance(top_k, int) and top_k <= 0:
             raise ValueError(f"top_k must be > 0, but got {top_k}")
@@ -89,14 +92,15 @@ class LostInTheMiddleRanker:
         top_k = top_k or self.top_k
         word_count_threshold = word_count_threshold or self.word_count_threshold
 
-        documents_to_reorder = documents[:top_k] if top_k else documents
+        deduplicated_documents = _deduplicate_documents(documents)
+        documents_to_reorder = deduplicated_documents[:top_k] if top_k else deduplicated_documents
 
         # If there's only one document, return it as is
         if len(documents_to_reorder) == 1:
             return {"documents": documents_to_reorder}
 
         # Raise an error if any document is not textual
-        if any(not doc.content_type == "text" for doc in documents_to_reorder):
+        if any(doc.content is None for doc in documents_to_reorder):
             raise ValueError("Some provided documents are not textual; LostInTheMiddleRanker can process only text.")
 
         # Initialize word count and indices for the "lost in the middle" order

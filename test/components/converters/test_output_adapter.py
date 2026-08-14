@@ -1,13 +1,20 @@
 # SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
 #
 # SPDX-License-Identifier: Apache-2.0
+
 import json
+from typing import Any, Callable, List
 
 import pytest
+from jinja2.nativetypes import NativeEnvironment
 
 from haystack import Pipeline, component
 from haystack.components.converters import OutputAdapter
 from haystack.components.converters.output_adapter import OutputAdaptationException
+from haystack.core.component.sockets import InputSocket
+from haystack.core.errors import DeserializationError
+from haystack.core.serialization_security import _deserialization_context
+from haystack.dataclasses import Document
 
 
 def custom_filter_to_sede(value):
@@ -95,6 +102,18 @@ class TestOutputAdapter:
         assert adapter.template == deserialized_adapter.template
         assert adapter.output_type == deserialized_adapter.output_type
 
+    def test_sede_with_callable_output_type(self):
+        # Regression test: `output_type=Callable[[int, str], bool]` used to lose its parameter list on
+        # `to_dict` (producing "typing.Callable[, bool]") and then fail to deserialize entirely.
+        adapter = OutputAdapter(template="{{ callback }}", output_type=Callable[[int, str], bool])
+        adapter_dict = adapter.to_dict()
+
+        assert adapter_dict["init_parameters"]["output_type"] == "typing.Callable[[int, str], bool]"
+
+        deserialized_adapter = OutputAdapter.from_dict(adapter_dict)
+        assert adapter.template == deserialized_adapter.template
+        assert adapter.output_type == deserialized_adapter.output_type
+
     # OutputAdapter can be serialized to a dictionary and deserialized along with custom filters
     def test_sede_with_custom_filters(self):
         # NOTE: filters need to be declared in a namespace visible to the deserialization function
@@ -129,6 +148,46 @@ class TestOutputAdapter:
         # invoke the custom filter to check if it is deserialized correctly
         assert deserialized_adapter.custom_filters["custom_filter"]("test") == "TEST"
 
+    def test_sede_with_list_output_type_in_pipeline(self):
+        pipe = Pipeline()
+        pipe.add_component("adapter", OutputAdapter(template="{{ test }}", output_type=list[str]))
+        serialized_pipe = pipe.dumps()
+
+        # we serialize the pipeline and check if the output type is serialized correctly (as list[str])
+        assert "list[str]" in serialized_pipe
+
+        deserialized_pipe = Pipeline.loads(serialized_pipe)
+        assert deserialized_pipe.get_component("adapter").output_type == list[str]
+
+    def test_sede_with_typing_list_output_type_in_pipeline(self):
+        pipe = Pipeline()
+        pipe.add_component("adapter", OutputAdapter(template="{{ test }}", output_type=List[str]))
+        serialized_pipe = pipe.dumps()
+
+        # we serialize the pipeline and check if the output type is serialized correctly (as list[str])
+        assert "typing.List[str]" in serialized_pipe
+
+        deserialized_pipe = Pipeline.loads(serialized_pipe)
+        assert deserialized_pipe.get_component("adapter").output_type == List[str]
+
+    def test_output_adapter_from_dict_custom_filters_none(self):
+        component = OutputAdapter.from_dict(
+            data={
+                "type": "haystack.components.converters.output_adapter.OutputAdapter",
+                "init_parameters": {
+                    "template": "{{ documents[0].content}}",
+                    "output_type": "str",
+                    "custom_filters": None,
+                    "unsafe": False,
+                },
+            }
+        )
+
+        assert component.template == "{{ documents[0].content}}"
+        assert component.output_type == str
+        assert component.custom_filters == {}
+        assert not component._unsafe
+
     def test_output_adapter_in_pipeline(self):
         @component
         class DocumentProducer:
@@ -150,3 +209,47 @@ class TestOutputAdapter:
         result = pipe.run(data={})
         assert result
         assert result["output_adapter"]["output"] == {"framework": "Haystack"}
+
+    def test_unsafe(self):
+        adapter = OutputAdapter(template="{{ documents[0] }}", output_type=Document, unsafe=True)
+        documents = [
+            Document(content="Test document"),
+            Document(content="Another test document"),
+            Document(content="Yet another test document"),
+        ]
+        res = adapter.run(documents=documents)
+        assert res["output"] == documents[0]
+
+    def test_from_dict_rejects_unsafe_in_safe_mode(self):
+        # A serialized component must not be able to disable its Jinja sandbox (`unsafe=True` swaps
+        # in a NativeEnvironment) on its own while the pipeline is being loaded in default safe mode.
+        data = {
+            "type": "haystack.components.converters.output_adapter.OutputAdapter",
+            "init_parameters": {"template": "{{ documents[0] }}", "output_type": "str", "unsafe": True},
+        }
+        with pytest.raises(DeserializationError, match="unsafe=True while loading in safe mode"):
+            OutputAdapter.from_dict(data)
+
+    def test_from_dict_allows_unsafe_when_loading_unsafe(self):
+        # When the loader explicitly opts into unsafe mode, the embedded `unsafe=True` is honored.
+        data = {
+            "type": "haystack.components.converters.output_adapter.OutputAdapter",
+            "init_parameters": {"template": "{{ documents[0] }}", "output_type": "str", "unsafe": True},
+        }
+        with _deserialization_context(unsafe=True):
+            adapter = OutputAdapter.from_dict(data)
+        assert adapter._unsafe
+        assert isinstance(adapter._env, NativeEnvironment)
+
+    def test_variables_correct_with_assignment(self) -> None:
+        template = """{% if control == 'something' %}
+    {% set output = 1 %}
+{% else %}
+    {% set output = 3 %}
+{% endif %}
+{{ output }}
+"""
+        adapter = OutputAdapter(template=template, output_type=int)
+        assert adapter.__haystack_input__._sockets_dict == {"control": InputSocket(name="control", type=Any)}
+        res = adapter.run(control="something")
+        assert res["output"] == 1

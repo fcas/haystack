@@ -2,19 +2,18 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List
 
 from haystack.core.component import component
 
 
 @component
 class Repeat:
-    def __init__(self, outputs: List[str]):
+    def __init__(self, outputs: list[str]) -> None:
         self._outputs = outputs
-        component.set_output_types(self, **{k: int for k in outputs})
+        component.set_output_types(self, **dict.fromkeys(outputs, int))
 
     def run(self, value: int):
         """
         :param value: the value to repeat.
         """
-        return {val: value for val in self._outputs}
+        return dict.fromkeys(self._outputs, value)

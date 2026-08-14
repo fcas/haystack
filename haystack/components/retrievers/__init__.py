@@ -2,8 +2,32 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from haystack.components.retrievers.filter_retriever import FilterRetriever
-from haystack.components.retrievers.in_memory.bm25_retriever import InMemoryBM25Retriever
-from haystack.components.retrievers.in_memory.embedding_retriever import InMemoryEmbeddingRetriever
+import sys
+from typing import TYPE_CHECKING
 
-__all__ = ["FilterRetriever", "InMemoryEmbeddingRetriever", "InMemoryBM25Retriever"]
+from lazy_imports import LazyImporter
+
+_import_structure = {
+    "auto_merging_retriever": ["AutoMergingRetriever"],
+    "filter_retriever": ["FilterRetriever"],
+    "in_memory": ["InMemoryBM25Retriever", "InMemoryEmbeddingRetriever"],
+    "multi_retriever": ["MultiRetriever"],
+    "multi_query_embedding_retriever": ["MultiQueryEmbeddingRetriever"],
+    "multi_query_text_retriever": ["MultiQueryTextRetriever"],
+    "sentence_window_retriever": ["SentenceWindowRetriever"],
+    "text_embedding_retriever": ["TextEmbeddingRetriever"],
+}
+
+if TYPE_CHECKING:
+    from .auto_merging_retriever import AutoMergingRetriever as AutoMergingRetriever
+    from .filter_retriever import FilterRetriever as FilterRetriever
+    from .in_memory import InMemoryBM25Retriever as InMemoryBM25Retriever
+    from .in_memory import InMemoryEmbeddingRetriever as InMemoryEmbeddingRetriever
+    from .multi_query_embedding_retriever import MultiQueryEmbeddingRetriever as MultiQueryEmbeddingRetriever
+    from .multi_query_text_retriever import MultiQueryTextRetriever as MultiQueryTextRetriever
+    from .multi_retriever import MultiRetriever as MultiRetriever
+    from .sentence_window_retriever import SentenceWindowRetriever as SentenceWindowRetriever
+    from .text_embedding_retriever import TextEmbeddingRetriever as TextEmbeddingRetriever
+
+else:
+    sys.modules[__name__] = LazyImporter(name=__name__, module_file=__file__, import_structure=_import_structure)

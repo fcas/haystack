@@ -1,15 +1,17 @@
 # SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
 #
 # SPDX-License-Identifier: Apache-2.0
-from typing import Dict, Any
+
+from typing import Any
 
 import pytest
 
-from haystack import Pipeline, DeserializationError
-from haystack.testing.factory import document_store_class
+from haystack import Pipeline
 from haystack.components.retrievers.in_memory import InMemoryBM25Retriever
 from haystack.dataclasses import Document
 from haystack.document_stores.in_memory import InMemoryDocumentStore
+from haystack.document_stores.types import FilterPolicy
+from haystack.testing.factory import document_store_class
 
 
 @pytest.fixture()
@@ -24,23 +26,21 @@ def mock_docs():
 
 
 class TestMemoryBM25Retriever:
-    def test_init_default(self):
-        retriever = InMemoryBM25Retriever(InMemoryDocumentStore())
+    def test_init_default(self, in_memory_doc_store):
+        retriever = InMemoryBM25Retriever(in_memory_doc_store)
         assert retriever.filters is None
         assert retriever.top_k == 10
         assert retriever.scale_score is False
 
-    def test_init_with_parameters(self):
-        retriever = InMemoryBM25Retriever(
-            InMemoryDocumentStore(), filters={"name": "test.txt"}, top_k=5, scale_score=True
-        )
+    def test_init_with_parameters(self, in_memory_doc_store):
+        retriever = InMemoryBM25Retriever(in_memory_doc_store, filters={"name": "test.txt"}, top_k=5, scale_score=True)
         assert retriever.filters == {"name": "test.txt"}
         assert retriever.top_k == 5
         assert retriever.scale_score
 
-    def test_init_with_invalid_top_k_parameter(self):
+    def test_init_with_invalid_top_k_parameter(self, in_memory_doc_store):
         with pytest.raises(ValueError):
-            InMemoryBM25Retriever(InMemoryDocumentStore(), top_k=-2)
+            InMemoryBM25Retriever(in_memory_doc_store, top_k=-2)
 
     def test_to_dict(self):
         MyFakeStore = document_store_class("MyFakeStore", bases=(InMemoryDocumentStore,))
@@ -56,15 +56,19 @@ class TestMemoryBM25Retriever:
                 "filters": None,
                 "top_k": 10,
                 "scale_score": False,
+                "filter_policy": "replace",
             },
         }
 
     def test_to_dict_with_custom_init_parameters(self):
-        ds = InMemoryDocumentStore()
+        ds = InMemoryDocumentStore(index="test_to_dict_with_custom_init_parameters")
         serialized_ds = ds.to_dict()
 
         component = InMemoryBM25Retriever(
-            document_store=InMemoryDocumentStore(), filters={"name": "test.txt"}, top_k=5, scale_score=True
+            document_store=InMemoryDocumentStore(index="test_to_dict_with_custom_init_parameters"),
+            filters={"name": "test.txt"},
+            top_k=5,
+            scale_score=True,
         )
         data = component.to_dict()
         assert data == {
@@ -74,10 +78,9 @@ class TestMemoryBM25Retriever:
                 "filters": {"name": "test.txt"},
                 "top_k": 5,
                 "scale_score": True,
+                "filter_policy": "replace",
             },
         }
-
-    #
 
     def test_from_dict(self):
         data = {
@@ -96,39 +99,90 @@ class TestMemoryBM25Retriever:
         assert component.filters == {"name": "test.txt"}
         assert component.top_k == 5
         assert component.scale_score is False
+        assert component.filter_policy == FilterPolicy.REPLACE
 
     def test_from_dict_without_docstore(self):
-        data = {"type": "InMemoryBM25Retriever", "init_parameters": {}}
-        with pytest.raises(DeserializationError, match="Missing 'document_store' in serialization data"):
+        data = {
+            "type": "haystack.components.retrievers.in_memory.bm25_retriever.InMemoryBM25Retriever",
+            "init_parameters": {},
+        }
+        with pytest.raises(TypeError, match="missing 1 required positional argument: 'document_store'"):
             InMemoryBM25Retriever.from_dict(data)
 
     def test_from_dict_without_docstore_type(self):
-        data = {"type": "InMemoryBM25Retriever", "init_parameters": {"document_store": {"init_parameters": {}}}}
-        with pytest.raises(DeserializationError, match="Missing 'type' in document store's serialization data"):
+        data = {
+            "type": "haystack.components.retrievers.in_memory.bm25_retriever.InMemoryBM25Retriever",
+            "init_parameters": {"document_store": {"init_parameters": {}}},
+        }
+        with pytest.raises(TypeError, match="document_store must be an instance of InMemoryDocumentStore"):
             InMemoryBM25Retriever.from_dict(data)
 
     def test_from_dict_nonexisting_docstore(self):
+        # Use a type whose module passes the deserialization allowlist (haystack.*) but cannot be
+        # resolved, so we still exercise the "import failed" code path rather than the allowlist gate.
         data = {
             "type": "haystack.components.retrievers.in_memory.bm25_retriever.InMemoryBM25Retriever",
-            "init_parameters": {"document_store": {"type": "Nonexisting.Docstore", "init_parameters": {}}},
+            "init_parameters": {"document_store": {"type": "haystack.does.not.exist.Docstore", "init_parameters": {}}},
         }
-        with pytest.raises(DeserializationError):
+        with pytest.raises(
+            ImportError, match=r"Failed to deserialize 'document_store':.*haystack\.does\.not\.exist\.Docstore"
+        ):
             InMemoryBM25Retriever.from_dict(data)
 
-    def test_retriever_valid_run(self, mock_docs):
-        ds = InMemoryDocumentStore()
-        ds.write_documents(mock_docs)
+    def test_retriever_valid_run(self, in_memory_doc_store, mock_docs):
+        in_memory_doc_store.write_documents(mock_docs)
 
-        retriever = InMemoryBM25Retriever(ds, top_k=5)
+        retriever = InMemoryBM25Retriever(in_memory_doc_store, top_k=5)
         result = retriever.run(query="PHP")
 
         assert "documents" in result
         assert len(result["documents"]) == 5
         assert result["documents"][0].content == "PHP is a popular programming language"
 
+    def test_run_with_filter_policy_merge_combines_init_and_runtime_filters(self, in_memory_doc_store):
+        in_memory_doc_store.write_documents(
+            [
+                Document(content="python article current", meta={"type": "article", "year": 2020}),
+                Document(content="python blog current", meta={"type": "blog", "year": 2021}),
+                Document(content="python article archived", meta={"type": "article", "year": 2019}),
+            ]
+        )
+
+        retriever = InMemoryBM25Retriever(
+            in_memory_doc_store,
+            filters={"field": "meta.type", "operator": "==", "value": "article"},
+            filter_policy=FilterPolicy.MERGE,
+        )
+
+        result = retriever.run(query="python", filters={"field": "meta.year", "operator": ">=", "value": 2020})
+
+        assert [doc.content for doc in result["documents"]] == ["python article current"]
+
+    @pytest.mark.asyncio
+    async def test_run_async_with_filter_policy_merge_combines_init_and_runtime_filters(self, in_memory_doc_store):
+        in_memory_doc_store.write_documents(
+            [
+                Document(content="python article current", meta={"type": "article", "year": 2020}),
+                Document(content="python blog current", meta={"type": "blog", "year": 2021}),
+                Document(content="python article archived", meta={"type": "article", "year": 2019}),
+            ]
+        )
+
+        retriever = InMemoryBM25Retriever(
+            in_memory_doc_store,
+            filters={"field": "meta.type", "operator": "==", "value": "article"},
+            filter_policy=FilterPolicy.MERGE,
+        )
+
+        result = await retriever.run_async(
+            query="python", filters={"field": "meta.year", "operator": ">=", "value": 2020}
+        )
+
+        assert [doc.content for doc in result["documents"]] == ["python article current"]
+
     def test_invalid_run_wrong_store_type(self):
         SomeOtherDocumentStore = document_store_class("SomeOtherDocumentStore")
-        with pytest.raises(ValueError, match="document_store must be an instance of InMemoryDocumentStore"):
+        with pytest.raises(TypeError, match="document_store must be an instance of InMemoryDocumentStore"):
             InMemoryBM25Retriever(SomeOtherDocumentStore())
 
     @pytest.mark.integration
@@ -139,14 +193,13 @@ class TestMemoryBM25Retriever:
             ("Java", "Java is a popular programming language"),
         ],
     )
-    def test_run_with_pipeline(self, mock_docs, query: str, query_result: str):
-        ds = InMemoryDocumentStore()
-        ds.write_documents(mock_docs)
-        retriever = InMemoryBM25Retriever(ds)
+    def test_run_with_pipeline(self, in_memory_doc_store, mock_docs, query: str, query_result: str):
+        in_memory_doc_store.write_documents(mock_docs)
+        retriever = InMemoryBM25Retriever(in_memory_doc_store)
 
         pipeline = Pipeline()
         pipeline.add_component("retriever", retriever)
-        result: Dict[str, Any] = pipeline.run(data={"retriever": {"query": query}})
+        result: dict[str, Any] = pipeline.run(data={"retriever": {"query": query}})
 
         assert result
         assert "retriever" in result
@@ -163,14 +216,15 @@ class TestMemoryBM25Retriever:
             ("Ruby", "Ruby is a popular programming language", 3),
         ],
     )
-    def test_run_with_pipeline_and_top_k(self, mock_docs, query: str, query_result: str, top_k: int):
-        ds = InMemoryDocumentStore()
-        ds.write_documents(mock_docs)
-        retriever = InMemoryBM25Retriever(ds)
+    def test_run_with_pipeline_and_top_k(
+        self, in_memory_doc_store, mock_docs, query: str, query_result: str, top_k: int
+    ):
+        in_memory_doc_store.write_documents(mock_docs)
+        retriever = InMemoryBM25Retriever(in_memory_doc_store)
 
         pipeline = Pipeline()
         pipeline.add_component("retriever", retriever)
-        result: Dict[str, Any] = pipeline.run(data={"retriever": {"query": query, "top_k": top_k}})
+        result: dict[str, Any] = pipeline.run(data={"retriever": {"query": query, "top_k": top_k}})
 
         assert result
         assert "retriever" in result

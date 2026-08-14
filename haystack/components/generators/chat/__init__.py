@@ -2,18 +2,29 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from haystack.components.generators.chat.openai import (  # noqa: I001 (otherwise we end up with partial imports)
-    OpenAIChatGenerator,
-)
-from haystack.components.generators.chat.azure import AzureOpenAIChatGenerator
-from haystack.components.generators.chat.hugging_face_local import HuggingFaceLocalChatGenerator
-from haystack.components.generators.chat.hugging_face_tgi import HuggingFaceTGIChatGenerator
-from haystack.components.generators.chat.hugging_face_api import HuggingFaceAPIChatGenerator
+import sys
+from typing import TYPE_CHECKING
 
-__all__ = [
-    "HuggingFaceLocalChatGenerator",
-    "HuggingFaceTGIChatGenerator",
-    "HuggingFaceAPIChatGenerator",
-    "OpenAIChatGenerator",
-    "AzureOpenAIChatGenerator",
-]
+from lazy_imports import LazyImporter
+
+_import_structure = {
+    "openai": ["OpenAIChatGenerator"],
+    "openai_responses": ["OpenAIResponsesChatGenerator"],
+    "azure": ["AzureOpenAIChatGenerator"],
+    "azure_responses": ["AzureOpenAIResponsesChatGenerator"],
+    "fallback": ["FallbackChatGenerator"],
+    "llm": ["LLM"],
+    "mock": ["MockChatGenerator"],
+}
+
+if TYPE_CHECKING:
+    from .azure import AzureOpenAIChatGenerator as AzureOpenAIChatGenerator
+    from .azure_responses import AzureOpenAIResponsesChatGenerator as AzureOpenAIResponsesChatGenerator
+    from .fallback import FallbackChatGenerator as FallbackChatGenerator
+    from .llm import LLM as LLM
+    from .mock import MockChatGenerator as MockChatGenerator
+    from .openai import OpenAIChatGenerator as OpenAIChatGenerator
+    from .openai_responses import OpenAIResponsesChatGenerator as OpenAIResponsesChatGenerator
+
+else:
+    sys.modules[__name__] = LazyImporter(name=__name__, module_file=__file__, import_structure=_import_structure)

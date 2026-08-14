@@ -1,28 +1,18 @@
 # SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
 #
 # SPDX-License-Identifier: Apache-2.0
+
+import contextlib
 import os
-from typing import List
-from haystack.utils.auth import Secret
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
-import numpy as np
 import pytest
+from openai import APIError
 
+import haystack.components.embedders.openai_document_embedder as openai_document_embedder_module
 from haystack import Document
 from haystack.components.embedders.openai_document_embedder import OpenAIDocumentEmbedder
-
-
-def mock_openai_response(input: List[str], model: str = "text-embedding-ada-002", **kwargs) -> dict:
-    dict_response = {
-        "object": "list",
-        "data": [
-            {"object": "embedding", "index": i, "embedding": np.random.rand(1536).tolist()} for i in range(len(input))
-        ],
-        "model": model,
-        "usage": {"prompt_tokens": 4, "total_tokens": 4},
-    }
-
-    return dict_response
+from haystack.utils.auth import Secret
 
 
 class TestOpenAIDocumentEmbedder:
@@ -38,8 +28,10 @@ class TestOpenAIDocumentEmbedder:
         assert embedder.progress_bar is True
         assert embedder.meta_fields_to_embed == []
         assert embedder.embedding_separator == "\n"
-        assert embedder.client.max_retries == 5
-        assert embedder.client.timeout == 30.0
+        assert embedder.timeout is None
+        assert embedder.max_retries is None
+        assert embedder.client is None
+        assert embedder.async_client is None
 
     def test_init_with_parameters(self, monkeypatch):
         monkeypatch.setenv("OPENAI_TIMEOUT", "100")
@@ -66,8 +58,10 @@ class TestOpenAIDocumentEmbedder:
         assert embedder.progress_bar is False
         assert embedder.meta_fields_to_embed == ["test_field"]
         assert embedder.embedding_separator == " | "
-        assert embedder.client.max_retries == 1
-        assert embedder.client.timeout == 40.0
+        assert embedder.timeout == 40.0
+        assert embedder.max_retries == 1
+        assert embedder.client is None
+        assert embedder.async_client is None
 
     def test_init_with_parameters_and_env_vars(self, monkeypatch):
         monkeypatch.setenv("OPENAI_TIMEOUT", "100")
@@ -92,13 +86,10 @@ class TestOpenAIDocumentEmbedder:
         assert embedder.progress_bar is False
         assert embedder.meta_fields_to_embed == ["test_field"]
         assert embedder.embedding_separator == " | "
-        assert embedder.client.max_retries == 10
-        assert embedder.client.timeout == 100.0
-
-    def test_init_fail_wo_api_key(self, monkeypatch):
-        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        with pytest.raises(ValueError, match="None of the .* environment variables are set"):
-            OpenAIDocumentEmbedder()
+        assert embedder.timeout is None
+        assert embedder.max_retries is None
+        assert embedder.client is None
+        assert embedder.async_client is None
 
     def test_to_dict(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "fake-api-key")
@@ -112,12 +103,16 @@ class TestOpenAIDocumentEmbedder:
                 "model": "text-embedding-ada-002",
                 "dimensions": None,
                 "organization": None,
+                "http_client_kwargs": None,
                 "prefix": "",
                 "suffix": "",
                 "batch_size": 32,
                 "progress_bar": True,
                 "meta_fields_to_embed": [],
                 "embedding_separator": "\n",
+                "timeout": None,
+                "max_retries": None,
+                "raise_on_failure": False,
             },
         }
 
@@ -127,12 +122,16 @@ class TestOpenAIDocumentEmbedder:
             api_key=Secret.from_env_var("ENV_VAR", strict=False),
             model="model",
             organization="my-org",
+            http_client_kwargs={"proxy": "http://localhost:8080"},
             prefix="prefix",
             suffix="suffix",
             batch_size=64,
             progress_bar=False,
             meta_fields_to_embed=["test_field"],
             embedding_separator=" | ",
+            timeout=10.0,
+            max_retries=2,
+            raise_on_failure=True,
         )
         data = component.to_dict()
         assert data == {
@@ -143,18 +142,23 @@ class TestOpenAIDocumentEmbedder:
                 "model": "model",
                 "dimensions": None,
                 "organization": "my-org",
+                "http_client_kwargs": {"proxy": "http://localhost:8080"},
                 "prefix": "prefix",
                 "suffix": "suffix",
                 "batch_size": 64,
                 "progress_bar": False,
                 "meta_fields_to_embed": ["test_field"],
                 "embedding_separator": " | ",
+                "timeout": 10.0,
+                "max_retries": 2,
+                "raise_on_failure": True,
             },
         }
 
     def test_prepare_texts_to_embed_w_metadata(self):
         documents = [
-            Document(content=f"document number {i}:\ncontent", meta={"meta_field": f"meta_value {i}"}) for i in range(5)
+            Document(id=f"{i}", content=f"document number {i}:\ncontent", meta={"meta_field": f"meta_value {i}"})
+            for i in range(5)
         ]
 
         embedder = OpenAIDocumentEmbedder(
@@ -163,17 +167,16 @@ class TestOpenAIDocumentEmbedder:
 
         prepared_texts = embedder._prepare_texts_to_embed(documents)
 
-        # note that newline is replaced by space
-        assert prepared_texts == [
-            "meta_value 0 | document number 0: content",
-            "meta_value 1 | document number 1: content",
-            "meta_value 2 | document number 2: content",
-            "meta_value 3 | document number 3: content",
-            "meta_value 4 | document number 4: content",
-        ]
+        assert prepared_texts == {
+            "0": "meta_value 0 | document number 0:\ncontent",
+            "1": "meta_value 1 | document number 1:\ncontent",
+            "2": "meta_value 2 | document number 2:\ncontent",
+            "3": "meta_value 3 | document number 3:\ncontent",
+            "4": "meta_value 4 | document number 4:\ncontent",
+        }
 
     def test_prepare_texts_to_embed_w_suffix(self):
-        documents = [Document(content=f"document number {i}") for i in range(5)]
+        documents = [Document(id=f"{i}", content=f"document number {i}") for i in range(5)]
 
         embedder = OpenAIDocumentEmbedder(
             api_key=Secret.from_token("fake-api-key"), prefix="my_prefix ", suffix=" my_suffix"
@@ -181,13 +184,13 @@ class TestOpenAIDocumentEmbedder:
 
         prepared_texts = embedder._prepare_texts_to_embed(documents)
 
-        assert prepared_texts == [
-            "my_prefix document number 0 my_suffix",
-            "my_prefix document number 1 my_suffix",
-            "my_prefix document number 2 my_suffix",
-            "my_prefix document number 3 my_suffix",
-            "my_prefix document number 4 my_suffix",
-        ]
+        assert prepared_texts == {
+            "0": "my_prefix document number 0 my_suffix",
+            "1": "my_prefix document number 1 my_suffix",
+            "2": "my_prefix document number 2 my_suffix",
+            "3": "my_prefix document number 3 my_suffix",
+            "4": "my_prefix document number 4 my_suffix",
+        }
 
     def test_run_wrong_input_format(self):
         embedder = OpenAIDocumentEmbedder(api_key=Secret.from_token("fake-api-key"))
@@ -197,19 +200,77 @@ class TestOpenAIDocumentEmbedder:
         list_integers_input = [1, 2, 3]
 
         with pytest.raises(TypeError, match="OpenAIDocumentEmbedder expects a list of Documents as input"):
-            embedder.run(documents=string_input)
+            embedder.run(documents=string_input)  # type: ignore[arg-type]
 
         with pytest.raises(TypeError, match="OpenAIDocumentEmbedder expects a list of Documents as input"):
-            embedder.run(documents=list_integers_input)
+            embedder.run(documents=list_integers_input)  # type: ignore[arg-type]
 
     def test_run_on_empty_list(self):
         embedder = OpenAIDocumentEmbedder(api_key=Secret.from_token("fake-api-key"))
 
-        empty_list_input = []
+        empty_list_input: list[Document] = []
         result = embedder.run(documents=empty_list_input)
 
         assert result["documents"] is not None
         assert not result["documents"]  # empty list
+
+    def test_embed_batch_handles_exceptions_gracefully(self, caplog):
+        embedder = OpenAIDocumentEmbedder(api_key=Secret.from_token("fake_api_key"))
+        embedder.warm_up()
+        assert embedder.client is not None
+        fake_texts_to_embed = {"1": "text1", "2": "text2"}
+        with patch.object(
+            embedder.client.embeddings,
+            "create",
+            side_effect=APIError(message="Mocked error", request=Mock(), body=None),
+        ):
+            embedder._embed_batch(texts_to_embed=fake_texts_to_embed, batch_size=2)
+
+        assert len(caplog.records) == 1
+        assert "Failed embedding of documents 1, 2 caused by Mocked error" in caplog.records[0].msg
+
+    def test_run_handles_exceptions_gracefully(self, caplog):
+        embedder = OpenAIDocumentEmbedder(api_key=Secret.from_token("fake_api_key"), batch_size=1)
+        embedder.warm_up()
+        assert embedder.client is not None
+        docs = [
+            Document(content="I love cheese", meta={"topic": "Cuisine"}),
+            Document(content="A transformer is a deep learning architecture", meta={"topic": "ML"}),
+        ]
+
+        # Create a successful response for the second call
+        successful_response = Mock()
+        successful_response.data = [
+            Mock(embedding=[0.4, 0.5, 0.6])  # Mock embedding for second doc
+        ]
+        successful_response.model = "text-embedding-ada-002"
+        successful_response.usage = {"prompt_tokens": 10, "total_tokens": 10}
+
+        with patch.object(
+            embedder.client.embeddings,
+            "create",
+            side_effect=[
+                APIError(message="Mocked error", request=Mock(), body=None),  # First call fails
+                successful_response,  # Second call succeeds
+            ],
+        ):
+            result = embedder.run(documents=docs)
+        assert len(result["documents"]) == 2
+        assert result["documents"][0].embedding is None
+        assert result["documents"][1].embedding == [0.4, 0.5, 0.6]
+
+    def test_embed_batch_raises_exception_on_failure(self):
+        embedder = OpenAIDocumentEmbedder(api_key=Secret.from_token("fake_api_key"), raise_on_failure=True)
+        embedder.warm_up()
+        assert embedder.client is not None
+        fake_texts_to_embed = {"1": "text1", "2": "text2"}
+        with patch.object(
+            embedder.client.embeddings,
+            "create",
+            side_effect=APIError(message="Mocked error", request=Mock(), body=None),
+        ):
+            with pytest.raises(APIError, match="Mocked error"):
+                embedder._embed_batch(texts_to_embed=fake_texts_to_embed, batch_size=2)
 
     @pytest.mark.skipif(os.environ.get("OPENAI_API_KEY", "") == "", reason="OPENAI_API_KEY is not set")
     @pytest.mark.integration
@@ -224,18 +285,147 @@ class TestOpenAIDocumentEmbedder:
         embedder = OpenAIDocumentEmbedder(model=model, meta_fields_to_embed=["topic"], embedding_separator=" | ")
 
         result = embedder.run(documents=docs)
+        assert embedder.client is not None
         documents_with_embeddings = result["documents"]
 
         assert isinstance(documents_with_embeddings, list)
         assert len(documents_with_embeddings) == len(docs)
-        for doc in documents_with_embeddings:
-            assert isinstance(doc, Document)
-            assert isinstance(doc.embedding, list)
-            assert len(doc.embedding) == 1536
-            assert all(isinstance(x, float) for x in doc.embedding)
+        for doc, new_doc in zip(docs, documents_with_embeddings, strict=True):
+            assert doc.embedding is None
+            assert new_doc is not doc
+            assert isinstance(new_doc, Document)
+            assert isinstance(new_doc.embedding, list)
+            assert len(new_doc.embedding) == 1536
+            assert all(isinstance(x, float) for x in new_doc.embedding)
 
-        assert (
-            "text" in result["meta"]["model"] and "ada" in result["meta"]["model"]
-        ), "The model name does not contain 'text' and 'ada'"
+        assert "text" in result["meta"]["model"] and "ada" in result["meta"]["model"], (
+            "The model name does not contain 'text' and 'ada'"
+        )
 
         assert result["meta"]["usage"] == {"prompt_tokens": 15, "total_tokens": 15}, "Usage information does not match"
+
+    @pytest.mark.skipif(os.environ.get("OPENAI_API_KEY", "") == "", reason="OPENAI_API_KEY is not set")
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_run_async(self):
+        embedder = OpenAIDocumentEmbedder(
+            model="text-embedding-ada-002", meta_fields_to_embed=["topic"], embedding_separator=" | "
+        )
+        docs = [
+            Document(content="I love cheese", meta={"topic": "Cuisine"}),
+            Document(content="A transformer is a deep learning architecture", meta={"topic": "ML"}),
+        ]
+
+        result = await embedder.run_async(documents=docs)
+        assert embedder.async_client is not None
+        documents_with_embeddings = result["documents"]
+
+        assert isinstance(documents_with_embeddings, list)
+        assert len(documents_with_embeddings) == len(docs)
+        for doc, new_doc in zip(docs, documents_with_embeddings, strict=True):
+            assert doc.embedding is None
+            assert new_doc is not doc
+            assert isinstance(new_doc, Document)
+            assert isinstance(new_doc.embedding, list)
+            assert len(new_doc.embedding) == 1536
+            assert all(isinstance(x, float) for x in new_doc.embedding)
+
+        assert "text" in result["meta"]["model"] and "ada" in result["meta"]["model"], (
+            "The model name does not contain 'text' and 'ada'"
+        )
+
+        assert result["meta"]["usage"] == {"prompt_tokens": 15, "total_tokens": 15}, "Usage information does not match"
+
+        # Close async client; suppress RuntimeError if the event loop is already closed
+        with contextlib.suppress(RuntimeError):
+            await embedder.close_async()
+
+
+@pytest.fixture
+def mock_openai_clients(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
+    sync_cls = MagicMock(name="OpenAI")
+    async_cls = MagicMock(name="AsyncOpenAI")
+    async_cls.return_value.close = AsyncMock()
+    monkeypatch.setattr(openai_document_embedder_module, "OpenAI", sync_cls)
+    monkeypatch.setattr(openai_document_embedder_module, "AsyncOpenAI", async_cls)
+    return sync_cls, async_cls
+
+
+class TestComponentLifecycle:
+    def test_warm_up_uses_default_timeout_and_max_retries(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "fake-api-key")
+        embedder = OpenAIDocumentEmbedder()
+        embedder.warm_up()
+        assert embedder.client is not None
+        assert embedder.client.max_retries == 5
+        assert embedder.client.timeout == 30.0
+
+    def test_warm_up_uses_timeout_and_max_retries_from_parameters(self):
+        embedder = OpenAIDocumentEmbedder(api_key=Secret.from_token("fake-api-key"), timeout=40.0, max_retries=1)
+        embedder.warm_up()
+        assert embedder.client is not None
+        assert embedder.client.max_retries == 1
+        assert embedder.client.timeout == 40.0
+
+    def test_warm_up_uses_timeout_and_max_retries_from_env_vars(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_TIMEOUT", "100")
+        monkeypatch.setenv("OPENAI_MAX_RETRIES", "10")
+        embedder = OpenAIDocumentEmbedder(api_key=Secret.from_token("fake-api-key"))
+        embedder.warm_up()
+        assert embedder.client is not None
+        assert embedder.client.max_retries == 10
+        assert embedder.client.timeout == 100.0
+
+    def test_key_resolved_at_warm_up_not_init(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        embedder = OpenAIDocumentEmbedder()
+        with pytest.raises(ValueError, match="None of the .* environment variables are set"):
+            embedder.warm_up()
+
+    def test_sync_lifecycle(self, mock_openai_clients):
+        sync_cls, _ = mock_openai_clients
+        sync_client = sync_cls.return_value
+        embedder = OpenAIDocumentEmbedder()
+        assert embedder.client is None
+        assert embedder.async_client is None
+
+        embedder.warm_up()
+        assert embedder.client is sync_cls.return_value
+        assert embedder.async_client is None
+
+        embedder.close()
+        sync_client.close.assert_called_once()
+        assert embedder.client is None
+
+    async def test_async_lifecycle(self, mock_openai_clients):
+        _, async_cls = mock_openai_clients
+        async_client = async_cls.return_value
+        embedder = OpenAIDocumentEmbedder()
+
+        await embedder.warm_up_async()
+        assert embedder.async_client is async_cls.return_value
+        assert embedder.client is None
+
+        await embedder.close_async()
+        async_client.close.assert_awaited_once()
+        assert embedder.async_client is None
+
+    async def test_close_is_safe_without_warm_up(self, mock_openai_clients):
+        embedder = OpenAIDocumentEmbedder()
+        embedder.close()
+        await embedder.close_async()
+        assert embedder.client is None
+        assert embedder.async_client is None
+
+    async def test_close_and_close_async_are_independent(self, mock_openai_clients):
+        embedder = OpenAIDocumentEmbedder()
+        embedder.warm_up()
+        await embedder.warm_up_async()
+
+        embedder.close()
+        assert embedder.client is None
+        assert embedder.async_client is not None
+
+        await embedder.close_async()
+        assert embedder.async_client is None

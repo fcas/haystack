@@ -2,16 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Protocol
 
-from haystack import logging
 from haystack.dataclasses import Document
 from haystack.document_stores.types.policy import DuplicatePolicy
-
-# Ellipsis are needed for the type checker, it's safe to disable module-wide
-# pylint: disable=unnecessary-ellipsis
-
-logger = logging.getLogger(__name__)
 
 
 class DocumentStore(Protocol):
@@ -25,14 +19,14 @@ class DocumentStore(Protocol):
     you're using.
     """
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """
         Serializes this store to a dictionary.
         """
         ...
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "DocumentStore":
+    def from_dict(cls, data: dict[str, Any]) -> "DocumentStore":
         """
         Deserializes the store from a dictionary.
         """
@@ -44,7 +38,7 @@ class DocumentStore(Protocol):
         """
         ...
 
-    def filter_documents(self, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
+    def filter_documents(self, filters: dict[str, Any] | None = None) -> list[Document]:
         """
         Returns the documents that match the filters provided.
 
@@ -112,7 +106,7 @@ class DocumentStore(Protocol):
         """
         ...
 
-    def write_documents(self, documents: List[Document], policy: DuplicatePolicy = DuplicatePolicy.NONE) -> int:
+    def write_documents(self, documents: list[Document], policy: DuplicatePolicy = DuplicatePolicy.NONE) -> int:
         """
         Writes Documents into the DocumentStore.
 
@@ -122,14 +116,15 @@ class DocumentStore(Protocol):
             - `DuplicatePolicy.SKIP`: If a Document with the same id already exists, it is skipped and not written.
             - `DuplicatePolicy.OVERWRITE`: If a Document with the same id already exists, it is overwritten.
             - `DuplicatePolicy.FAIL`: If a Document with the same id already exists, an error is raised.
-        :raises DuplicateError: If `policy` is set to `DuplicatePolicy.FAIL` and a Document with the same id already exists.
+        :raises DuplicateError: If `policy` is set to `DuplicatePolicy.FAIL` and a Document with the same id already
+            exists.
         :returns: The number of Documents written.
             If `DuplicatePolicy.OVERWRITE` is used, this number is always equal to the number of documents in input.
             If `DuplicatePolicy.SKIP` is used, this number can be lower than the number of documents in the input list.
         """
         ...
 
-    def delete_documents(self, document_ids: List[str]) -> None:
+    def delete_documents(self, document_ids: list[str]) -> None:
         """
         Deletes all documents with a matching document_ids from the DocumentStore.
 

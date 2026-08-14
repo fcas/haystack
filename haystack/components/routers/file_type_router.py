@@ -6,10 +6,16 @@ import mimetypes
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any
 
-from haystack import component, logging
+from haystack import component, default_from_dict, default_to_dict, logging
+from haystack.components.converters.utils import get_bytestream_from_source, normalize_metadata
 from haystack.dataclasses import ByteStream
+
+from haystack.utils.misc import _guess_mime_type  # ruff: isort: skip
+
+# We import CUSTOM_MIMETYPES here to prevent breaking change from moving to haystack.utils.misc
+from haystack.utils.misc import CUSTOM_MIMETYPES  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -17,29 +23,26 @@ logger = logging.getLogger(__name__)
 @component
 class FileTypeRouter:
     """
-    Groups a list of data sources by their MIME types.
+    Categorizes files or byte streams by their MIME types, helping in context-based routing.
 
-    FileTypeRouter groups a list of data sources (file paths or byte streams) by their MIME types, allowing
-    for flexible routing of files to different components based on their content type. It supports both exact MIME type
-    matching and pattern matching using regular expressions.
+    FileTypeRouter supports both exact MIME type matching and regex patterns.
 
-    For file paths, MIME types are inferred from their extensions, while for byte streams, MIME types are determined from
-    the provided metadata. This enables the router to classify a diverse collection of files and data streams for
-    specialized processing.
+    For file paths, MIME types come from extensions; byte streams use metadata.
+    Each entry in `mime_types` is matched against a source's MIME type by exact equality first,
+    falling back to regex `fullmatch` if equality misses. So `"image/svg+xml"` routes
+    `image/svg+xml` streams correctly via the equality check (without `+` being interpreted as a
+    regex quantifier), and patterns like `"audio/.*"` keep matching every audio subtype.
 
-    The router's flexibility is enhanced by the support for regex patterns in the `mime_types` parameter, allowing users
-    to specify broad categories (e.g., 'audio/*' or 'text/*') or more specific types with regex patterns. This feature
-    is designed to be backward compatible, treating MIME types without regex patterns as exact matches.
+    ### Usage example
 
-    Usage example:
     ```python
     from haystack.components.routers import FileTypeRouter
     from pathlib import Path
 
-    # For exact MIME type matching
-    router = FileTypeRouter(mime_types=["text/plain", "application/pdf"])
+    # Exact MIME matching — `+`-containing IANA types like image/svg+xml work correctly
+    router = FileTypeRouter(mime_types=["text/plain", "application/pdf", "image/svg+xml"])
 
-    # For flexible matching using regex, to handle all audio types
+    # Regex matching — catch every audio subtype
     router_with_regex = FileTypeRouter(mime_types=[r"audio/.*", r"text/plain"])
 
     sources = [Path("file.txt"), Path("document.pdf"), Path("song.mp3")]
@@ -47,97 +50,154 @@ class FileTypeRouter:
     print(router_with_regex.run(sources=sources))
 
     # Expected output:
-    # {'text/plain': [PosixPath('file.txt')], 'application/pdf': [PosixPath('document.pdf')], 'unclassified': [PosixPath('song.mp3')]}
-    # {'audio/.*': [PosixPath('song.mp3')], 'text/plain': [PosixPath('file.txt')], 'unclassified': [PosixPath('document.pdf')]}
+    # {'text/plain': [
+    #   PosixPath('file.txt')], 'application/pdf': [PosixPath('document.pdf')], 'unclassified': [PosixPath('song.mp3')
+    # ]}
+    # {'audio/.*': [
+    #   PosixPath('song.mp3')], 'text/plain': [PosixPath('file.txt')], 'unclassified': [PosixPath('document.pdf')
+    # ]}
     ```
-
-    :param mime_types: A list of MIME types or regex patterns to classify the incoming files or data streams.
     """
 
-    def __init__(self, mime_types: List[str]):
+    def __init__(
+        self, mime_types: list[str], additional_mimetypes: dict[str, str] | None = None, raise_on_failure: bool = False
+    ) -> None:
         """
         Initialize the FileTypeRouter component.
 
-        :param mime_types: A list of file mime types to consider when routing files
-            (e.g. `["text/plain", "audio/x-wav", "image/jpeg"]`).
+        :param mime_types:
+            A list of MIME types or regex patterns to classify the input files or byte streams.
+            (for example: `["text/plain", "audio/x-wav", "image/jpeg"]`).
+
+        :param additional_mimetypes:
+            A dictionary containing the MIME type to add to the mimetypes package to prevent unsupported or non-native
+            packages from being unclassified.
+            (for example: `{"application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx"}`).
+
+        :param raise_on_failure:
+            If True, raises FileNotFoundError when a file path doesn't exist.
+            If False (default), only emits a warning when a file path doesn't exist.
         """
         if not mime_types:
             raise ValueError("The list of mime types cannot be empty.")
 
+        if additional_mimetypes:
+            for mime, ext in additional_mimetypes.items():
+                mimetypes.add_type(mime, ext)
+
         self.mime_type_patterns = []
         for mime_type in mime_types:
-            if not self._is_valid_mime_type_format(mime_type):
-                raise ValueError(f"Invalid mime type or regex pattern: '{mime_type}'.")
-            pattern = re.compile(mime_type)
+            try:
+                pattern = re.compile(mime_type)
+            except re.error as e:
+                raise ValueError(f"Invalid MIME type or regex pattern '{mime_type}'.") from e
             self.mime_type_patterns.append(pattern)
 
-        component.set_output_types(self, unclassified=List[Path], **{mime_type: List[Path] for mime_type in mime_types})
+        # the actual output type is list[Union[Path, ByteStream]],
+        # but this would cause PipelineConnectError with Converters
+        component.set_output_types(
+            self,
+            unclassified=list[str | Path | ByteStream],
+            failed=list[str | Path | ByteStream],
+            **dict.fromkeys(mime_types, list[str | Path | ByteStream]),
+        )
         self.mime_types = mime_types
+        self._additional_mimetypes = additional_mimetypes
+        self._raise_on_failure = raise_on_failure
 
-    def run(self, sources: List[Union[str, Path, ByteStream]]) -> Dict[str, List[Union[ByteStream, Path]]]:
+    def to_dict(self) -> dict[str, Any]:
         """
-        Categorizes the provided data sources by their MIME types.
+        Serializes the component to a dictionary.
 
-        :param sources: A list of file paths or byte streams to categorize.
+        :returns:
+            Dictionary with serialized data.
+        """
+        return default_to_dict(
+            self,
+            mime_types=self.mime_types,
+            additional_mimetypes=self._additional_mimetypes,
+            raise_on_failure=self._raise_on_failure,
+        )
 
-        :returns: A dictionary where the keys are MIME types (or `"unclassified"`) and the values are lists of data sources.
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "FileTypeRouter":
+        """
+        Deserializes the component from a dictionary.
+
+        :param data:
+            The dictionary to deserialize from.
+        :returns:
+            The deserialized component.
+        """
+        return default_from_dict(cls, data)
+
+    def run(
+        self, sources: list[str | Path | ByteStream], meta: dict[str, Any] | list[dict[str, Any]] | None = None
+    ) -> dict[str, list[ByteStream | Path]]:
+        """
+        Categorize files or byte streams according to their MIME types.
+
+        :param sources:
+            A list of file paths or byte streams to categorize.
+
+        :param meta:
+            Optional metadata to attach to the sources.
+            When provided, the sources are internally converted to ByteStream objects and the metadata is added.
+            This value can be a list of dictionaries or a single dictionary.
+            If it's a single dictionary, its content is added to the metadata of all ByteStream objects.
+            If it's a list, its length must match the number of sources, as they are zipped together.
+
+        :returns: A dictionary where the keys are MIME types and the values are lists of data sources.
+                  Two extra keys may be returned: `"unclassified"` when a source's MIME type doesn't match any pattern
+                   and `"failed"` when a source cannot be processed (for example, a file path that doesn't exist).
+        :raises TypeError: If a source is not a Path, str, or ByteStream.
         """
 
-        mime_types = defaultdict(list)
-        for source in sources:
+        mime_types: defaultdict[str, list[Path | ByteStream]] = defaultdict(list)
+        meta_list = normalize_metadata(meta=meta, sources_count=len(sources))
+
+        for source, meta_dict in zip(sources, meta_list, strict=True):
             if isinstance(source, str):
                 source = Path(source)
+
             if isinstance(source, Path):
-                mime_type = self._get_mime_type(source)
+                if not source.exists():
+                    if self._raise_on_failure:
+                        raise FileNotFoundError(f"File not found: {source}")
+                    logger.warning("File not found: {source}. Skipping it.", source=source)
+                    mime_types["failed"].append(source)
+                    continue
+
+                mime_type = _guess_mime_type(source)
+
             elif isinstance(source, ByteStream):
                 mime_type = source.mime_type
             else:
-                raise ValueError(f"Unsupported data source type: {type(source).__name__}")
+                raise TypeError(f"Unsupported data source type: {type(source).__name__}")
+
+            # If we have metadata, we convert the source to ByteStream and add the metadata
+            if meta_dict:
+                try:
+                    source = get_bytestream_from_source(source)
+                except Exception as e:
+                    if self._raise_on_failure:
+                        raise e
+                    logger.warning("Could not read {source}. Skipping it. Error: {error}", source=source, error=e)
+                    mime_types["failed"].append(source)
+                    continue
+
+                source.meta.update(meta_dict)
 
             matched = False
             if mime_type:
-                for pattern in self.mime_type_patterns:
-                    if pattern.fullmatch(mime_type):
-                        mime_types[pattern.pattern].append(source)
+                # Try exact equality first so MIMEs containing regex metacharacters (e.g. the `+` in
+                # `image/svg+xml`) match themselves before the regex fallback gets a chance to misread them.
+                for bucket_key, pattern in zip(self.mime_types, self.mime_type_patterns, strict=True):
+                    if mime_type == bucket_key or pattern.fullmatch(mime_type):
+                        mime_types[bucket_key].append(source)
                         matched = True
                         break
             if not matched:
                 mime_types["unclassified"].append(source)
 
         return dict(mime_types)
-
-    def _get_mime_type(self, path: Path) -> Optional[str]:
-        """
-        Get the MIME type of the provided file path.
-
-        :param path: The file path to get the MIME type for.
-
-        :returns: The MIME type of the provided file path, or `None` if the MIME type cannot be determined.
-        """
-        extension = path.suffix.lower()
-        mime_type = mimetypes.guess_type(path.as_posix())[0]
-        # lookup custom mappings if the mime type is not found
-        return self._get_custom_mime_mappings().get(extension, mime_type)
-
-    def _is_valid_mime_type_format(self, mime_type: str) -> bool:
-        """
-        Checks if the provided MIME type string is a valid regex pattern.
-
-        :param mime_type: The MIME type or regex pattern to validate.
-        :raises ValueError: If the mime_type is not a valid regex pattern.
-        :returns: Always True because a ValueError is raised for invalid patterns.
-        """
-        try:
-            re.compile(mime_type)
-            return True
-        except re.error:
-            raise ValueError(f"Invalid regex pattern '{mime_type}'.")
-
-    @staticmethod
-    def _get_custom_mime_mappings() -> Dict[str, str]:
-        """
-        Returns a dictionary of custom file extension to MIME type mappings.
-        """
-        # we add markdown because it is not added by the mimetypes module
-        # see https://github.com/python/cpython/pull/17995
-        return {".md": "text/markdown", ".markdown": "text/markdown"}

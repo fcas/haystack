@@ -2,11 +2,17 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
+import json
 import math
 import re
+import uuid
 from collections import Counter
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any, Literal
 
 import numpy as np
 
@@ -15,16 +21,17 @@ from haystack.dataclasses import Document
 from haystack.document_stores.errors import DocumentStoreError, DuplicateDocumentError
 from haystack.document_stores.types import DuplicatePolicy
 from haystack.utils import expit
-from haystack.utils.filters import convert, document_matches_filter
+from haystack.utils.filters import document_matches_filter
 
 logger = logging.getLogger(__name__)
 
 # document scores are essentially unbounded and will be scaled to values between 0 and 1 if scale_score is set to
 # True (default). Scaling uses the expit function (inverse of the logit function) after applying a scaling factor
 # (e.g., BM25_SCALING_FACTOR for the bm25_retrieval method).
-# Larger scaling factor decreases scaled scores. For example, an input of 10 is scaled to 0.99 with BM25_SCALING_FACTOR=2
-# but to 0.78 with BM25_SCALING_FACTOR=8 (default). The defaults were chosen empirically. Increase the default if most
-# unscaled scores are larger than expected (>30) and otherwise would incorrectly all be mapped to scores ~1.
+# Larger scaling factor decreases scaled scores. For example, an input of 10 is scaled to 0.99 with
+# BM25_SCALING_FACTOR=2 but to 0.78 with BM25_SCALING_FACTOR=8 (default). The defaults were chosen empirically.
+# Increase the default if most unscaled scores are larger than expected (>30) and otherwise would incorrectly all be
+# mapped to scores ~1.
 BM25_SCALING_FACTOR = 8
 DOT_PRODUCT_SCALING_FACTOR = 100
 
@@ -38,8 +45,16 @@ class BM25DocumentStats:
     :param doc_len: Number of tokens in the document.
     """
 
-    freq_token: Dict[str, int]
+    freq_token: dict[str, int]
     doc_len: int
+
+
+# Process-global storage, keyed by index, for stores created with shared=True. Lets instances sharing an index
+# operate on the same data. Non-shared stores keep their data instance-local instead (see `__init__`).
+_STORAGES: dict[str, dict[str, Document]] = {}
+_BM25_STATS_STORAGES: dict[str, dict[str, BM25DocumentStats]] = {}
+_AVERAGE_DOC_LEN_STORAGES: dict[str, float] = {}
+_FREQ_VOCAB_FOR_IDF_STORAGES: dict[str, Counter] = {}
 
 
 class InMemoryDocumentStore:
@@ -49,41 +64,120 @@ class InMemoryDocumentStore:
 
     def __init__(
         self,
-        bm25_tokenization_regex: str = r"(?u)\b\w\w+\b",
+        bm25_tokenization_regex: str = r"(?u)\b\w+\b",
         bm25_algorithm: Literal["BM25Okapi", "BM25L", "BM25Plus"] = "BM25L",
-        bm25_parameters: Optional[Dict] = None,
+        bm25_parameters: dict | None = None,
         embedding_similarity_function: Literal["dot_product", "cosine"] = "dot_product",
-    ):
+        index: str | None = None,
+        shared: bool = True,
+        async_executor: ThreadPoolExecutor | None = None,
+        return_embedding: bool = True,
+        *,
+        strict_datetime_comparison: bool = False,
+    ) -> None:
         """
         Initializes the DocumentStore.
 
         :param bm25_tokenization_regex: The regular expression used to tokenize the text for BM25 retrieval.
         :param bm25_algorithm: The BM25 algorithm to use. One of "BM25Okapi", "BM25L", or "BM25Plus".
         :param bm25_parameters: Parameters for BM25 implementation in a dictionary format.
-                                For example: {'k1':1.5, 'b':0.75, 'epsilon':0.25}
-                                You can learn more about these parameters by visiting https://github.com/dorianbrown/rank_bm25.
-                                By default, no parameters are set.
+            For example: `{'k1':1.5, 'b':0.75, 'epsilon':0.25}`
+            You can learn more about these parameters by visiting https://github.com/dorianbrown/rank_bm25.
         :param embedding_similarity_function: The similarity function used to compare Documents embeddings.
-                                              One of "dot_product" (default) or "cosine".
-                                              To choose the most appropriate function, look for information about your embedding model.
+            One of "dot_product" (default) or "cosine". To choose the most appropriate function, look for information
+            about your embedding model.
+        :param index: A specific index to store the documents. If not specified, a random UUID is used.
+            When `shared` is True, instances using the same index share the same documents.
+        :param shared: Whether the documents live in process-global storage shared across instances using the same
+            index (True, the default), or are kept instance-local and freed when this instance is garbage collected
+            (False). Shared storage persists for the lifetime of the process, so prefer `shared=False` for stores
+            that are created frequently (for example per request) to avoid unbounded memory growth.
+        :param async_executor:
+            Optional ThreadPoolExecutor to use for async calls. If not provided, a single-threaded
+            executor will be initialized and used.
+        :param return_embedding: Whether to return the embedding of the retrieved Documents. Default is True.
+        :param strict_datetime_comparison:
+            If `True`, timezone-naive and timezone-aware datetimes never match each other in filters.
+            If `False` (the default), the timezone from the aware datetime is copied to the naive one before
+            comparing.
         """
-        self.storage: Dict[str, Document] = {}
         self.bm25_tokenization_regex = bm25_tokenization_regex
         self.tokenizer = re.compile(bm25_tokenization_regex).findall
+
+        # Shared stores keep their data in the process-global dicts keyed by index, so instances sharing an index
+        # operate on the same documents. Non-shared stores keep their data instance-local so it is freed with the
+        # instance instead of accumulating in the globals.
+        self._shared = shared
+        self.index = index if index is not None else str(uuid.uuid4())
+
+        if self._shared:
+            if self.index not in _STORAGES:
+                _STORAGES[self.index] = {}
+                _BM25_STATS_STORAGES[self.index] = {}
+                _AVERAGE_DOC_LEN_STORAGES[self.index] = 0.0
+                _FREQ_VOCAB_FOR_IDF_STORAGES[self.index] = Counter()
+        else:
+            self._local_storage: dict[str, Document] = {}
+            self._local_bm25_attr: dict[str, BM25DocumentStats] = {}
+            self._local_avg_doc_len: float = 0.0
+            self._local_freq_vocab_for_idf: Counter = Counter()
 
         self.bm25_algorithm = bm25_algorithm
         self.bm25_algorithm_inst = self._dispatch_bm25()
         self.bm25_parameters = bm25_parameters or {}
         self.embedding_similarity_function = embedding_similarity_function
 
-        # Global BM25 statistics
-        self._avg_doc_len: float = 0.0
-        self._freq_vocab_for_idf: Counter = Counter()
+        # keep track of whether we own the executor if we created it we must also clean it up
+        self._owns_executor = async_executor is None
+        self.executor = (
+            ThreadPoolExecutor(thread_name_prefix=f"async-inmemory-docstore-executor-{id(self)}", max_workers=1)
+            if async_executor is None
+            else async_executor
+        )
+        self.return_embedding = return_embedding
+        self.strict_datetime_comparison = strict_datetime_comparison
 
-        # Per-document statistics
-        self._bm25_attr: Dict[str, BM25DocumentStats] = {}
+    def __del__(self) -> None:
+        """
+        Cleanup when the instance is being destroyed.
+        """
+        if hasattr(self, "_owns_executor") and self._owns_executor and hasattr(self, "executor"):
+            self.executor.shutdown(wait=True)
 
-    def _dispatch_bm25(self):
+    def shutdown(self) -> None:
+        """
+        Explicitly shutdown the executor if we own it.
+        """
+        if self._owns_executor:
+            self.executor.shutdown(wait=True)
+
+    @property
+    def storage(self) -> dict[str, Document]:
+        """
+        Utility property that returns the storage used by this instance of InMemoryDocumentStore.
+        """
+        return _STORAGES[self.index] if self._shared else self._local_storage
+
+    @property
+    def _bm25_attr(self) -> dict[str, BM25DocumentStats]:
+        return _BM25_STATS_STORAGES[self.index] if self._shared else self._local_bm25_attr
+
+    @property
+    def _avg_doc_len(self) -> float:
+        return _AVERAGE_DOC_LEN_STORAGES[self.index] if self._shared else self._local_avg_doc_len
+
+    @_avg_doc_len.setter
+    def _avg_doc_len(self, value: float) -> None:
+        if self._shared:
+            _AVERAGE_DOC_LEN_STORAGES[self.index] = value
+        else:
+            self._local_avg_doc_len = value
+
+    @property
+    def _freq_vocab_for_idf(self) -> Counter:
+        return _FREQ_VOCAB_FOR_IDF_STORAGES[self.index] if self._shared else self._local_freq_vocab_for_idf
+
+    def _dispatch_bm25(self) -> "Callable[[str, list[Document]], list[tuple[Document, float]]]":
         """
         Select the correct BM25 algorithm based on user specification.
 
@@ -96,7 +190,7 @@ class InMemoryDocumentStore:
             raise ValueError(f"BM25 algorithm '{self.bm25_algorithm}' is not supported.")
         return table[self.bm25_algorithm]
 
-    def _tokenize_bm25(self, text: str) -> List[str]:
+    def _tokenize_bm25(self, text: str) -> list[str]:
         """
         Tokenize text using the BM25 tokenization regex.
 
@@ -113,7 +207,7 @@ class InMemoryDocumentStore:
         text = text.lower()
         return self.tokenizer(text)
 
-    def _score_bm25l(self, query: str, documents: List[Document]) -> List[Tuple[Document, float]]:
+    def _score_bm25l(self, query: str, documents: list[Document]) -> list[tuple[Document, float]]:
         """
         Calculate BM25L scores for the given query and filtered documents.
 
@@ -129,7 +223,7 @@ class InMemoryDocumentStore:
         b = self.bm25_parameters.get("b", 0.75)
         delta = self.bm25_parameters.get("delta", 0.5)
 
-        def _compute_idf(tokens: List[str]) -> Dict[str, float]:
+        def _compute_idf(tokens: list[str]) -> dict[str, float]:
             """Per-token IDF computation for all tokens."""
             idf = {}
             n_corpus = len(self._bm25_attr)
@@ -138,7 +232,7 @@ class InMemoryDocumentStore:
                 idf[tok] = math.log((n_corpus + 1.0) / (n + 0.5)) * int(n != 0)
             return idf
 
-        def _compute_tf(token: str, freq: Dict[str, int], doc_len: int) -> float:
+        def _compute_tf(token: str, freq: dict[str, int], doc_len: int) -> float:
             """Per-token BM25L computation."""
             freq_term = freq.get(token, 0.0)
             ctd = freq_term / (1 - b + b * doc_len / self._avg_doc_len)
@@ -154,13 +248,13 @@ class InMemoryDocumentStore:
             doc_len = doc_stats.doc_len
 
             score = 0.0
-            for tok in idf.keys():  # pylint: disable=consider-using-dict-items
+            for tok in idf.keys():
                 score += idf[tok] * _compute_tf(tok, freq, doc_len)
             ret.append((doc, score))
 
         return ret
 
-    def _score_bm25okapi(self, query: str, documents: List[Document]) -> List[Tuple[Document, float]]:
+    def _score_bm25okapi(self, query: str, documents: list[Document]) -> list[tuple[Document, float]]:
         """
         Calculate BM25Okapi scores for the given query and filtered documents.
 
@@ -170,13 +264,13 @@ class InMemoryDocumentStore:
             The list of documents to score, should be produced by
             the filter_documents method; may be an empty list.
         :returns:
-            A list of tuples, each containing a Document and its BM25L score.
+            A list of tuples, each containing a Document and its BM25Okapi score.
         """
         k = self.bm25_parameters.get("k1", 1.5)
         b = self.bm25_parameters.get("b", 0.75)
         epsilon = self.bm25_parameters.get("epsilon", 0.25)
 
-        def _compute_idf(tokens: List[str]) -> Dict[str, float]:
+        def _compute_idf(tokens: list[str]) -> dict[str, float]:
             """Per-token IDF computation for all tokens."""
             sum_idf = 0.0
             neg_idf_tokens = []
@@ -196,8 +290,8 @@ class InMemoryDocumentStore:
                 idf[tok] = eps
             return {tok: idf.get(tok, 0.0) for tok in tokens}
 
-        def _compute_tf(token: str, freq: Dict[str, int], doc_len: int) -> float:
-            """Per-token BM25L computation."""
+        def _compute_tf(token: str, freq: dict[str, int], doc_len: int) -> float:
+            """Per-token BM25Okapi computation."""
             freq_term = freq.get(token, 0.0)
             freq_norm = freq_term + k * (1 - b + b * doc_len / self._avg_doc_len)
             return freq_term * (1.0 + k) / freq_norm
@@ -218,7 +312,7 @@ class InMemoryDocumentStore:
 
         return ret
 
-    def _score_bm25plus(self, query: str, documents: List[Document]) -> List[Tuple[Document, float]]:
+    def _score_bm25plus(self, query: str, documents: list[Document]) -> list[tuple[Document, float]]:
         """
         Calculate BM25+ scores for the given query and filtered documents.
 
@@ -237,7 +331,7 @@ class InMemoryDocumentStore:
         b = self.bm25_parameters.get("b", 0.75)
         delta = self.bm25_parameters.get("delta", 1.0)
 
-        def _compute_idf(tokens: List[str]) -> Dict[str, float]:
+        def _compute_idf(tokens: list[str]) -> dict[str, float]:
             """Per-token IDF computation."""
             idf = {}
             n_corpus = len(self._bm25_attr)
@@ -246,7 +340,7 @@ class InMemoryDocumentStore:
                 idf[tok] = math.log(1 + (n_corpus - n + 0.5) / (n + 0.5)) * int(n != 0)
             return idf
 
-        def _compute_tf(token: str, freq: Dict[str, int], doc_len: float) -> float:
+        def _compute_tf(token: str, freq: dict[str, int], doc_len: float) -> float:
             """Per-token normalized term frequency."""
             freq_term = freq.get(token, 0.0)
             freq_damp = k * (1 - b + b * doc_len / self._avg_doc_len)
@@ -262,13 +356,13 @@ class InMemoryDocumentStore:
             doc_len = doc_stats.doc_len
 
             score = 0.0
-            for tok in idf.keys():  # pylint: disable=consider-using-dict-items
+            for tok in idf.keys():
                 score += idf[tok] * _compute_tf(tok, freq, doc_len)
             ret.append((doc, score))
 
         return ret
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """
         Serializes the component to a dictionary.
 
@@ -281,10 +375,14 @@ class InMemoryDocumentStore:
             bm25_algorithm=self.bm25_algorithm,
             bm25_parameters=self.bm25_parameters,
             embedding_similarity_function=self.embedding_similarity_function,
+            index=self.index,
+            shared=self._shared,
+            return_embedding=self.return_embedding,
+            strict_datetime_comparison=self.strict_datetime_comparison,
         )
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "InMemoryDocumentStore":
+    def from_dict(cls, data: dict[str, Any]) -> "InMemoryDocumentStore":
         """
         Deserializes the component from a dictionary.
 
@@ -295,28 +393,73 @@ class InMemoryDocumentStore:
         """
         return default_from_dict(cls, data)
 
+    def save_to_disk(self, path: str) -> None:
+        """
+        Write the database and its data to disk as a JSON file.
+
+        :param path: The path to the JSON file.
+        """
+        data: dict[str, Any] = self.to_dict()
+        data["documents"] = [doc.to_dict(flatten=False) for doc in self.storage.values()]
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    @classmethod
+    def load_from_disk(cls, path: str) -> "InMemoryDocumentStore":
+        """
+        Load the database and its data from disk as a JSON file.
+
+        :param path: The path to the JSON file.
+        :returns: The loaded InMemoryDocumentStore.
+        """
+        if Path(path).exists():
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+            except Exception as e:
+                raise DocumentStoreError(f"Error loading InMemoryDocumentStore from disk. error: {e}") from e
+
+            documents = data.pop("documents")
+            cls_object = default_from_dict(cls, data)
+            cls_object.write_documents(
+                documents=[Document.from_dict(doc) for doc in documents], policy=DuplicatePolicy.OVERWRITE
+            )
+            return cls_object
+
+        raise FileNotFoundError(f"File {path} not found.")
+
     def count_documents(self) -> int:
         """
-        Returns the number of how many documents are present in the DocumentStore.
+        Returns the number of documents present in the DocumentStore.
         """
         return len(self.storage.keys())
 
-    def filter_documents(self, filters: Optional[Dict[str, Any]] = None) -> List[Document]:
+    def filter_documents(self, filters: dict[str, Any] | None = None) -> list[Document]:
         """
         Returns the documents that match the filters provided.
 
-        For a detailed specification of the filters, refer to the DocumentStore.filter_documents() protocol documentation.
-
-        :param filters: The filters to apply to the document list.
+        :param filters: The filters to apply. For a detailed specification of the filters, refer to the
+            [documentation](https://docs.haystack.deepset.ai/docs/metadata-filtering).
         :returns: A list of Documents that match the given filters.
         """
         if filters:
-            if "operator" not in filters and "conditions" not in filters:
-                filters = convert(filters)
-            return [doc for doc in self.storage.values() if document_matches_filter(filters=filters, document=doc)]
-        return list(self.storage.values())
+            InMemoryDocumentStore._validate_filters(filters)
+            docs = [
+                doc
+                for doc in self.storage.values()
+                if document_matches_filter(
+                    filters=filters, document=doc, strict_datetime_comparison=self.strict_datetime_comparison
+                )
+            ]
+        else:
+            docs = list(self.storage.values())
 
-    def write_documents(self, documents: List[Document], policy: DuplicatePolicy = DuplicatePolicy.NONE) -> int:
+        if not self.return_embedding:
+            docs = [replace(doc, embedding=None) for doc in docs]
+
+        return docs
+
+    def write_documents(self, documents: list[Document], policy: DuplicatePolicy = DuplicatePolicy.NONE) -> int:
         """
         Refer to the DocumentStore.write_documents() protocol documentation.
 
@@ -348,36 +491,24 @@ class InMemoryDocumentStore:
             if document.id in self.storage.keys():
                 self.delete_documents([document.id])
 
-            # This processing logic is extracted from the original bm25_retrieval method.
-            # Since we are creating index incrementally before the first retrieval,
-            # we need to determine what content to use for indexing here, not at query time.
+            tokens = []
             if document.content is not None:
-                if document.dataframe is not None:
-                    logger.warning(
-                        "Document '{document_id}' has both text and dataframe content. "
-                        "Using text content for retrieval and skipping dataframe content.",
-                        document_id=document.id,
-                    )
                 tokens = self._tokenize_bm25(document.content)
-            elif document.dataframe is not None:
-                str_content = document.dataframe.astype(str)
-                csv_content = str_content.to_csv(index=False)
-                tokens = self._tokenize_bm25(csv_content)
-            else:
-                tokens = []
 
             self.storage[document.id] = document
 
             self._bm25_attr[document.id] = BM25DocumentStats(Counter(tokens), len(tokens))
             self._freq_vocab_for_idf.update(set(tokens))
-            self._avg_doc_len = (len(tokens) + self._avg_doc_len * len(self._bm25_attr)) / (len(self._bm25_attr) + 1)
+            # Update avg doc len based on the new document and the previous average
+            n_docs = len(self._bm25_attr)
+            self._avg_doc_len = (len(tokens) + self._avg_doc_len * (n_docs - 1)) / n_docs
         return written_documents
 
-    def delete_documents(self, document_ids: List[str]) -> None:
+    def delete_documents(self, document_ids: list[str]) -> None:
         """
         Deletes all documents with matching document_ids from the DocumentStore.
 
-        :param document_ids: The object_ids to delete.
+        :param document_ids: The document_ids to delete.
         """
         for doc_id in document_ids:
             if doc_id not in self.storage.keys():
@@ -390,14 +521,212 @@ class InMemoryDocumentStore:
             doc_len = doc_stats.doc_len
 
             self._freq_vocab_for_idf.subtract(Counter(freq.keys()))
+            for token in freq:
+                if self._freq_vocab_for_idf[token] <= 0:
+                    del self._freq_vocab_for_idf[token]
             try:
                 self._avg_doc_len = (self._avg_doc_len * (len(self._bm25_attr) + 1) - doc_len) / len(self._bm25_attr)
             except ZeroDivisionError:
                 self._avg_doc_len = 0
 
+    @staticmethod
+    def _validate_filters(filters: dict[str, Any] | None) -> None:
+        if filters and "operator" not in filters and "conditions" not in filters:
+            raise ValueError(
+                "Invalid filter syntax. See https://docs.haystack.deepset.ai/docs/metadata-filtering for details."
+            )
+
+    def delete_all_documents(self) -> None:
+        """
+        Deletes all documents in the document store.
+        """
+        if self._shared:
+            _STORAGES[self.index] = {}
+            _BM25_STATS_STORAGES[self.index] = {}
+            _AVERAGE_DOC_LEN_STORAGES[self.index] = 0.0
+            _FREQ_VOCAB_FOR_IDF_STORAGES[self.index] = Counter()
+        else:
+            self._local_storage = {}
+            self._local_bm25_attr = {}
+            self._local_avg_doc_len = 0.0
+            self._local_freq_vocab_for_idf = Counter()
+
+    def update_by_filter(self, filters: dict[str, Any], meta: dict[str, Any]) -> int:
+        """
+        Updates the metadata of all documents that match the provided filters.
+
+        :param filters: The filters to apply to select documents for updating.
+            For filter syntax, see filter_documents.
+        :param meta: The metadata fields to update. These will be merged with existing metadata.
+        :returns: The number of documents updated.
+        :raises ValueError: if filters have invalid syntax.
+        """
+        InMemoryDocumentStore._validate_filters(filters)
+        matching = [
+            doc
+            for doc in self.storage.values()
+            if document_matches_filter(
+                filters=filters, document=doc, strict_datetime_comparison=self.strict_datetime_comparison
+            )
+        ]
+        for doc in matching:
+            doc.meta.update(meta)
+            self.storage[doc.id] = doc
+        return len(matching)
+
+    def delete_by_filter(self, filters: dict[str, Any]) -> int:
+        """
+        Deletes all documents that match the provided filters.
+
+        :param filters: The filters to apply to select documents for deletion.
+            For filter syntax, see filter_documents.
+        :returns: The number of documents deleted.
+        :raises ValueError: if filters have invalid syntax.
+        """
+        InMemoryDocumentStore._validate_filters(filters)
+        matching = [
+            doc
+            for doc in self.storage.values()
+            if document_matches_filter(
+                filters=filters, document=doc, strict_datetime_comparison=self.strict_datetime_comparison
+            )
+        ]
+        doc_ids = [doc.id for doc in matching]
+        self.delete_documents(doc_ids)
+        return len(doc_ids)
+
+    def count_documents_by_filter(self, filters: dict[str, Any]) -> int:
+        """
+        Returns the number of documents that match the provided filters.
+
+        :param filters: The filters to apply.
+            For a detailed specification of the filters, refer to the
+            [documentation](https://docs.haystack.deepset.ai/docs/metadata-filtering).
+        :returns: The number of documents that match the filters.
+        """
+        if filters:
+            InMemoryDocumentStore._validate_filters(filters)
+            return sum(
+                1
+                for doc in self.storage.values()
+                if document_matches_filter(
+                    filters=filters, document=doc, strict_datetime_comparison=self.strict_datetime_comparison
+                )
+            )
+        return len(self.storage)
+
+    def count_unique_metadata_by_filter(self, filters: dict[str, Any], metadata_fields: list[str]) -> dict[str, int]:
+        """
+        Returns the number of unique values for each specified metadata field from documents matching the filters.
+
+        :param filters: The filters to apply.
+            For a detailed specification of the filters, refer to the
+            [documentation](https://docs.haystack.deepset.ai/docs/metadata-filtering).
+        :param metadata_fields: List of field names to count unique values for.
+            Field names can include or omit the "meta." prefix.
+        :returns: A dictionary mapping each metadata field name (without "meta." prefix)
+            to the count of its unique values among the filtered documents.
+        """
+        if filters:
+            InMemoryDocumentStore._validate_filters(filters)
+            docs = [
+                doc
+                for doc in self.storage.values()
+                if document_matches_filter(
+                    filters=filters, document=doc, strict_datetime_comparison=self.strict_datetime_comparison
+                )
+            ]
+        else:
+            docs = list(self.storage.values())
+
+        result: dict[str, int] = {}
+        for field in metadata_fields:
+            key = field.removeprefix("meta.") if field.startswith("meta.") else field
+            values = {doc.meta.get(key) for doc in docs if key in doc.meta and doc.meta[key] is not None}
+            result[key] = len(values)
+        return result
+
+    def get_metadata_fields_info(self) -> dict[str, dict[str, str]]:
+        """
+        Returns information about the metadata fields present in the stored documents.
+
+        Types are inferred from the stored values (keyword, int, float, boolean).
+
+        :returns: A dictionary mapping each metadata field name to a dict with a "type" key.
+        """
+        type_map: dict[str, str] = {}
+        for doc in self.storage.values():
+            for key, value in doc.meta.items():
+                if value is None:
+                    continue
+                if isinstance(value, bool):
+                    type_map[key] = "boolean"
+                elif isinstance(value, int):
+                    type_map[key] = "int"
+                elif isinstance(value, float):
+                    type_map[key] = "float"
+                else:
+                    type_map[key] = "keyword"
+        return {k: {"type": v} for k, v in type_map.items()}
+
+    def get_metadata_field_min_max(self, metadata_field: str) -> dict[str, Any]:
+        """
+        Returns the minimum and maximum values for the given metadata field across all documents.
+
+        :param metadata_field: The metadata field name. Can include or omit the "meta." prefix.
+        :returns: A dictionary with "min" and "max" keys. Returns `{"min": None, "max": None}`
+            if the field is missing or has no values.
+        """
+        key = metadata_field.removeprefix("meta.") if metadata_field.startswith("meta.") else metadata_field
+        values = [
+            doc.meta[key]
+            for doc in self.storage.values()
+            if key in doc.meta and doc.meta[key] is not None and isinstance(doc.meta[key], (int, float, str))
+        ]
+        if not values:
+            return {"min": None, "max": None}
+        try:
+            return {"min": min(values), "max": max(values)}
+        except TypeError:
+            return {"min": None, "max": None}
+
+    def get_metadata_field_unique_values(
+        self,
+        metadata_field: str,
+        search_term: str | None = None,
+        from_: int = 0,
+        size: int = 10,
+        filters: dict[str, Any] | None = None,
+    ) -> tuple[list[Any], int]:
+        """
+        Returns unique values for a metadata field, optionally filtered by a search term, with pagination.
+
+        :param metadata_field: The metadata field name. Can include or omit the "meta." prefix.
+        :param search_term: Optional search term to filter values, matched as a case-insensitive substring
+            against the metadata field's value.
+        :param from_: The offset to start returning values from (for pagination).
+        :param size: The maximum number of unique values to return.
+        :param filters: Optional filters to restrict the documents considered.
+        :returns: A tuple of (paginated list of unique values, total count of unique values).
+        """
+        key = metadata_field.removeprefix("meta.") if metadata_field.startswith("meta.") else metadata_field
+        unique_values: dict[tuple[str, str], Any] = {}
+        for doc in self.filter_documents(filters=filters):
+            value = doc.meta.get(key)
+            if value is not None:
+                unique_values.setdefault((type(value).__name__, str(value)), value)
+
+        if search_term:
+            search_term_lower = search_term.lower()
+            unique_values = {k: v for k, v in unique_values.items() if search_term_lower in k[1].lower()}
+
+        sorted_keys = sorted(unique_values, key=lambda k: (k[1], k[0]))
+        paginated_keys = sorted_keys[from_ : from_ + size]
+        return [unique_values[k] for k in paginated_keys], len(sorted_keys)
+
     def bm25_retrieval(
-        self, query: str, filters: Optional[Dict[str, Any]] = None, top_k: int = 10, scale_score: bool = False
-    ) -> List[Document]:
+        self, query: str, filters: dict[str, Any] | None = None, top_k: int = 10, scale_score: bool = False
+    ) -> list[Document]:
         """
         Retrieves documents that are most relevant to the query using BM25 algorithm.
 
@@ -410,16 +739,12 @@ class InMemoryDocumentStore:
         if not query:
             raise ValueError("Query should be a non-empty string")
 
-        content_type_filter = {
-            "operator": "OR",
-            "conditions": [
-                {"field": "content", "operator": "!=", "value": None},
-                {"field": "dataframe", "operator": "!=", "value": None},
-            ],
-        }
+        content_type_filter = {"field": "content", "operator": "!=", "value": None}
         if filters:
             if "operator" not in filters:
-                filters = convert(filters)
+                raise ValueError(
+                    "Invalid filter syntax. See https://docs.haystack.deepset.ai/docs/metadata-filtering for details."
+                )
             filters = {"operator": "AND", "conditions": [content_type_filter, filters]}
         else:
             filters = content_type_filter
@@ -429,7 +754,16 @@ class InMemoryDocumentStore:
             logger.info("No documents found for BM25 retrieval. Returning empty list.")
             return []
 
-        results = sorted(self.bm25_algorithm_inst(query, all_documents), key=lambda x: x[1], reverse=True)[:top_k]
+        # A tokenless corpus (every stored document has empty content) has no vocabulary and an
+        # average document length of zero, which would make all three BM25 algorithms divide by
+        # zero during scoring. Score every candidate as 0.0 instead; the non-positive-score
+        # handling below then keeps them for BM25Okapi (unscaled) and drops them otherwise.
+        if self._avg_doc_len == 0:
+            scored_documents = [(doc, 0.0) for doc in all_documents]
+        else:
+            scored_documents = self.bm25_algorithm_inst(query, all_documents)
+
+        results = sorted(scored_documents, key=lambda x: x[1], reverse=True)[:top_k]
 
         # BM25Okapi can return meaningful negative values, so they should not be filtered out when scale_score is False.
         # It's the only algorithm supported by rank_bm25 at the time of writing (2024) that can return negative scores.
@@ -447,19 +781,24 @@ class InMemoryDocumentStore:
 
             doc_fields = doc.to_dict()
             doc_fields["score"] = score
+
+            if not self.return_embedding and "embedding" in doc_fields:
+                doc_fields.pop("embedding")
+
             return_document = Document.from_dict(doc_fields)
+
             return_documents.append(return_document)
 
         return return_documents
 
     def embedding_retrieval(
         self,
-        query_embedding: List[float],
-        filters: Optional[Dict[str, Any]] = None,
+        query_embedding: list[float],
+        filters: dict[str, Any] | None = None,
         top_k: int = 10,
         scale_score: bool = False,
-        return_embedding: bool = False,
-    ) -> List[Document]:
+        return_embedding: bool | None = False,
+    ) -> list[Document]:
         """
         Retrieves documents that are most similar to the query embedding using a vector similarity metric.
 
@@ -467,14 +806,26 @@ class InMemoryDocumentStore:
         :param filters: A dictionary with filters to narrow down the search space.
         :param top_k: The number of top documents to retrieve. Default is 10.
         :param scale_score: Whether to scale the scores of the retrieved Documents. Default is False.
-        :param return_embedding: Whether to return the embedding of the retrieved Documents. Default is False.
+        :param return_embedding: Whether to return the embedding of the retrieved Documents.
+            If not provided, the value of the `return_embedding` parameter set at component
+            initialization will be used. Default is False.
         :returns: A list of the top_k documents most relevant to the query.
+        :raises ValueError: if filters have invalid syntax.
         """
         if len(query_embedding) == 0 or not isinstance(query_embedding[0], float):
             raise ValueError("query_embedding should be a non-empty list of floats.")
 
-        filters = filters or {}
-        all_documents = self.filter_documents(filters=filters)
+        if filters:
+            InMemoryDocumentStore._validate_filters(filters)
+            all_documents = [
+                doc
+                for doc in self.storage.values()
+                if document_matches_filter(
+                    filters=filters, document=doc, strict_datetime_comparison=self.strict_datetime_comparison
+                )
+            ]
+        else:
+            all_documents = list(self.storage.values())
 
         documents_with_embeddings = [doc for doc in all_documents if doc.embedding is not None]
         if len(documents_with_embeddings) == 0:
@@ -483,30 +834,33 @@ class InMemoryDocumentStore:
                 "To generate embeddings, use a DocumentEmbedder."
             )
             return []
-        elif len(documents_with_embeddings) < len(all_documents):
+        if len(documents_with_embeddings) < len(all_documents):
             logger.info(
-                "Skipping some Documents that don't have an embedding. "
-                "To generate embeddings, use a DocumentEmbedder."
+                "Skipping some Documents that don't have an embedding. To generate embeddings, use a DocumentEmbedder."
             )
 
         scores = self._compute_query_embedding_similarity_scores(
             embedding=query_embedding, documents=documents_with_embeddings, scale_score=scale_score
         )
 
+        resolved_return_embedding = self.return_embedding if return_embedding is None else return_embedding
+
         # create Documents with the similarity score for the top k results
         top_documents = []
-        for doc, score in sorted(zip(documents_with_embeddings, scores), key=lambda x: x[1], reverse=True)[:top_k]:
+        for doc, score in sorted(zip(documents_with_embeddings, scores, strict=True), key=lambda x: x[1], reverse=True)[
+            :top_k
+        ]:
             doc_fields = doc.to_dict()
             doc_fields["score"] = score
-            if return_embedding is False:
+            if resolved_return_embedding is False:
                 doc_fields["embedding"] = None
             top_documents.append(Document.from_dict(doc_fields))
 
         return top_documents
 
     def _compute_query_embedding_similarity_scores(
-        self, embedding: List[float], documents: List[Document], scale_score: bool = False
-    ) -> List[float]:
+        self, embedding: list[float], documents: list[Document], scale_score: bool = False
+    ) -> list[float]:
         """
         Computes the similarity scores between the query embedding and the embeddings of the documents.
 
@@ -533,9 +887,12 @@ class InMemoryDocumentStore:
             document_embeddings = np.expand_dims(a=document_embeddings, axis=0)
 
         if self.embedding_similarity_function == "cosine":
-            # cosine similarity is a normed dot product
-            query_embedding /= np.linalg.norm(x=query_embedding, axis=1, keepdims=True)
-            document_embeddings /= np.linalg.norm(x=document_embeddings, axis=1, keepdims=True)
+            # cosine similarity is a normed dot product; guard against zero-norm vectors
+            # (e.g. a zero embedding) which would otherwise divide by zero and yield NaN scores.
+            query_norm = np.linalg.norm(x=query_embedding, axis=1, keepdims=True)
+            document_norms = np.linalg.norm(x=document_embeddings, axis=1, keepdims=True)
+            query_embedding /= np.where(query_norm == 0.0, 1.0, query_norm)
+            document_embeddings /= np.where(document_norms == 0.0, 1.0, document_norms)
 
         try:
             scores = np.dot(a=query_embedding, b=document_embeddings.T)[0].tolist()
@@ -554,3 +911,188 @@ class InMemoryDocumentStore:
                 scores = [(score + 1) / 2 for score in scores]
 
         return scores
+
+    async def count_documents_async(self) -> int:
+        """
+        Returns the number of documents present in the DocumentStore.
+        """
+        return len(self.storage.keys())
+
+    async def filter_documents_async(self, filters: dict[str, Any] | None = None) -> list[Document]:
+        """
+        Returns the documents that match the filters provided.
+
+        :param filters: The filters to apply. For a detailed specification of the filters, refer to the
+            [documentation](https://docs.haystack.deepset.ai/docs/metadata-filtering).
+        :returns: A list of Documents that match the given filters.
+        """
+        return await asyncio.get_running_loop().run_in_executor(
+            self.executor, lambda: self.filter_documents(filters=filters)
+        )
+
+    async def write_documents_async(
+        self, documents: list[Document], policy: DuplicatePolicy = DuplicatePolicy.NONE
+    ) -> int:
+        """
+        Refer to the DocumentStore.write_documents() protocol documentation.
+
+        If `policy` is set to `DuplicatePolicy.NONE` defaults to `DuplicatePolicy.FAIL`.
+        """
+        return await asyncio.get_running_loop().run_in_executor(
+            self.executor, lambda: self.write_documents(documents=documents, policy=policy)
+        )
+
+    async def delete_documents_async(self, document_ids: list[str]) -> None:
+        """
+        Deletes all documents with matching document_ids from the DocumentStore.
+
+        :param document_ids: The document_ids to delete.
+        """
+        await asyncio.get_running_loop().run_in_executor(
+            self.executor, lambda: self.delete_documents(document_ids=document_ids)
+        )
+
+    async def update_by_filter_async(self, filters: dict[str, Any], meta: dict[str, Any]) -> int:
+        """
+        Updates the metadata of all documents that match the provided filters.
+
+        :param filters: The filters to apply to select documents for updating.
+            For filter syntax, see filter_documents.
+        :param meta: The metadata fields to update. These will be merged with existing metadata.
+        :returns: The number of documents updated.
+        """
+        return await asyncio.get_running_loop().run_in_executor(
+            self.executor, lambda: self.update_by_filter(filters=filters, meta=meta)
+        )
+
+    async def count_documents_by_filter_async(self, filters: dict[str, Any]) -> int:
+        """
+        Returns the number of documents that match the provided filters.
+
+        :param filters: The filters to apply.
+            For a detailed specification of the filters, refer to the
+            [documentation](https://docs.haystack.deepset.ai/docs/metadata-filtering).
+        :returns: The number of documents that match the filters.
+        """
+        return await asyncio.get_running_loop().run_in_executor(
+            self.executor, lambda: self.count_documents_by_filter(filters=filters)
+        )
+
+    async def count_unique_metadata_by_filter_async(
+        self, filters: dict[str, Any], metadata_fields: list[str]
+    ) -> dict[str, int]:
+        """
+        Returns the number of unique values for each specified metadata field from documents matching the filters.
+
+        :param filters: The filters to apply.
+            For a detailed specification of the filters, refer to the
+            [documentation](https://docs.haystack.deepset.ai/docs/metadata-filtering).
+        :param metadata_fields: List of field names to count unique values for.
+            Field names can include or omit the "meta." prefix.
+        :returns: A dictionary mapping each metadata field name (without "meta." prefix)
+            to the count of its unique values among the filtered documents.
+        """
+        return await asyncio.get_running_loop().run_in_executor(
+            self.executor,
+            lambda: self.count_unique_metadata_by_filter(filters=filters, metadata_fields=metadata_fields),
+        )
+
+    async def get_metadata_fields_info_async(self) -> dict[str, dict[str, str]]:
+        """
+        Returns information about the metadata fields present in the stored documents.
+
+        Types are inferred from the stored values (keyword, int, float, boolean).
+
+        :returns: A dictionary mapping each metadata field name to a dict with a "type" key.
+        """
+        return await asyncio.get_running_loop().run_in_executor(self.executor, self.get_metadata_fields_info)
+
+    async def get_metadata_field_min_max_async(self, metadata_field: str) -> dict[str, Any]:
+        """
+        Returns the minimum and maximum values for the given metadata field across all documents.
+
+        :param metadata_field: The metadata field name. Can include or omit the "meta." prefix.
+        :returns: A dictionary with "min" and "max" keys. Returns `{"min": None, "max": None}`
+            if the field is missing or has no values.
+        """
+        return await asyncio.get_running_loop().run_in_executor(
+            self.executor, lambda: self.get_metadata_field_min_max(metadata_field=metadata_field)
+        )
+
+    async def get_metadata_field_unique_values_async(
+        self,
+        metadata_field: str,
+        search_term: str | None = None,
+        from_: int = 0,
+        size: int = 10,
+        filters: dict[str, Any] | None = None,
+    ) -> tuple[list[Any], int]:
+        """
+        Returns unique values for a metadata field, optionally filtered by a search term, with pagination.
+
+        :param metadata_field: The metadata field name. Can include or omit the "meta." prefix.
+        :param search_term: Optional search term to filter values, matched as a case-insensitive substring
+            against the metadata field's value.
+        :param from_: The offset to start returning values from (for pagination).
+        :param size: The maximum number of unique values to return.
+        :param filters: Optional filters to restrict the documents considered.
+        :returns: A tuple of (paginated list of unique values, total count of unique values).
+        """
+        return await asyncio.get_running_loop().run_in_executor(
+            self.executor,
+            lambda: self.get_metadata_field_unique_values(
+                metadata_field=metadata_field, search_term=search_term, from_=from_, size=size, filters=filters
+            ),
+        )
+
+    async def delete_all_documents_async(self) -> None:
+        """
+        Deletes all documents in the document store.
+        """
+        await asyncio.get_running_loop().run_in_executor(self.executor, self.delete_all_documents)
+
+    async def bm25_retrieval_async(
+        self, query: str, filters: dict[str, Any] | None = None, top_k: int = 10, scale_score: bool = False
+    ) -> list[Document]:
+        """
+        Retrieves documents that are most relevant to the query using BM25 algorithm.
+
+        :param query: The query string.
+        :param filters: A dictionary with filters to narrow down the search space.
+        :param top_k: The number of top documents to retrieve. Default is 10.
+        :param scale_score: Whether to scale the scores of the retrieved documents. Default is False.
+        :returns: A list of the top_k documents most relevant to the query.
+        """
+        return await asyncio.get_running_loop().run_in_executor(
+            self.executor,
+            lambda: self.bm25_retrieval(query=query, filters=filters, top_k=top_k, scale_score=scale_score),
+        )
+
+    async def embedding_retrieval_async(
+        self,
+        query_embedding: list[float],
+        filters: dict[str, Any] | None = None,
+        top_k: int = 10,
+        scale_score: bool = False,
+        return_embedding: bool = False,
+    ) -> list[Document]:
+        """
+        Retrieves documents that are most similar to the query embedding using a vector similarity metric.
+
+        :param query_embedding: Embedding of the query.
+        :param filters: A dictionary with filters to narrow down the search space.
+        :param top_k: The number of top documents to retrieve. Default is 10.
+        :param scale_score: Whether to scale the scores of the retrieved Documents. Default is False.
+        :param return_embedding: Whether to return the embedding of the retrieved Documents. Default is False.
+        :returns: A list of the top_k documents most relevant to the query.
+        """
+        return await asyncio.get_running_loop().run_in_executor(
+            self.executor,
+            lambda: self.embedding_retrieval(
+                query_embedding=query_embedding,
+                filters=filters,
+                top_k=top_k,
+                scale_score=scale_score,
+                return_embedding=return_embedding,
+            ),
+        )

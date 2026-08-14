@@ -1,21 +1,15 @@
 [build-system]
-requires = [
-  "hatchling>=1.8.0",
-]
+requires = ["hatchling>=1.8.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "haystack-ai"
-dynamic = [
-  "version",
-]
+dynamic = ["version"]
 description = "LLM framework to build customizable, production-ready LLM applications. Connect components (models, vector DBs, file converters) to pipelines or agents that can interact with your data."
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.8"
-authors = [
-  { name = "deepset.ai", email = "malte.pietsch@deepset.ai" },
-]
+requires-python = ">=3.10"
+authors = [{ name = "deepset.ai", email = "malte.pietsch@deepset.ai" }]
 keywords = [
   "BERT",
   "QA",
@@ -40,134 +34,124 @@ classifiers = [
   "Operating System :: OS Independent",
   "Programming Language :: Python",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.8",
-  "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-  "pandas",
   "tqdm",
-  "tenacity",
+  "tenacity!=8.4.0",
   "lazy-imports",
-  "openai>=1.1.0",
+  "openai>=2.6.0",
+  "pydantic",
   "Jinja2",
-  "posthog",  # telemetry
+  "MarkupSafe",             # already required by Jinja2 but used directly in templatize_part
+  "posthog!=3.12.0",        # telemetry # 3.12.0 was problematic https://github.com/PostHog/posthog-python/issues/187
   "pyyaml",
-  "more-itertools",  # TextDocumentSplitter
-  "networkx", # Pipeline graphs
-  "typing_extensions>=4.7", # typing support for Python 3.8
-  "trafilatura", # Fulltext extraction from HTML pages
-  "requests",
+  "more-itertools",         # DocumentSplitter
+  "networkx",               # Pipeline graphs
+  "typing_extensions>=4.7", # Extended typing features (NotRequired, etc.)
+  "httpx",
   "numpy",
   "python-dateutil",
+  "jsonschema",             # JsonSchemaValidator, Tool
+  "docstring-parser",       # ComponentTool
+  "filetype",               # MIME type guessing for ImageContent
 ]
 
 [tool.hatch.envs.default]
+installer = "uv"
 dependencies = [
   "pre-commit",
-  # Type check
-  "mypy",
-  # Test
-  "pytest",
-  "pytest-cov",
-  "pytest-custom_exit_code",  # used in the CI
-  "pytest-asyncio",
-  "pytest-rerunfailures",
-  "responses",
-  "tox",
-  "coverage",
-  "python-multipart",
-  "psutil",
-  # Linting
-  "pylint",
-  "ruff",
-  # Documentation
+  "ruff>=0.16.0",
   "toml",
   "reno",
   # dulwich is a reno dependency, they pin it at >=0.15.0 so pip takes ton of time to resolve the dependency tree.
   # We pin it here to avoid taking too much time.
   # https://opendev.org/openstack/reno/src/branch/master/requirements.txt#L7
   "dulwich>=0.21.0,<1.0.0",
-  # Version specified following Black stability policy:
-  # https://black.readthedocs.io/en/stable/the_black_code_style/index.html#stability-policy
-  "black[jupyter]~=23.0",
+  "haystack-pydoc-tools",
 ]
 
 [tool.hatch.envs.default.scripts]
-format = "black ."
-format-check = "black --check ."
+release-note = "reno new {args}"
+fmt = "ruff check --fix {args}; ruff format {args}"
+fmt-check = "ruff check {args} && ruff format --check {args}"
+docs = "haystack-pydoc pydoc tmp_api_reference"
 
 [tool.hatch.envs.test]
-extra-dependencies = [
-  "transformers[torch,sentencepiece]==4.38.2",  # ExtractiveReader, TransformersSimilarityRanker, LocalWhisperTranscriber, HFGenerators...
-  "huggingface_hub>=0.23.0", # TGI Generators and TEI Embedders
-  "spacy>=3.7,<3.8",  # NamedEntityExtractor
-  "spacy-curated-transformers>=0.2,<=0.3",  # NamedEntityExtractor
-  "en-core-web-trf @ https://github.com/explosion/spacy-models/releases/download/en_core_web_trf-3.7.3/en_core_web_trf-3.7.3-py3-none-any.whl",  # NamedEntityExtractor
+
+# we override dependencies from the default environment
+dependencies = [
+  # Haystack is compatible both with numpy 1.x and 2.x, but we test with 2.x.
+  # numpy 2.5 stubs use PEP 695 `type` statements, which mypy rejects under python_version = "3.10".
+  "numpy>=2,<2.5",
+  "numba>=0.54.0", # This pin helps uv resolve the dependency tree. See https://github.com/astral-sh/uv/issues/7881
+
+  "pandas",                                           # AzureOCRDocumentConverter, CSVDocumentCleaner, CSVDocumentSplitter,
+                                                      # EvaluationRunResult, XLSXToDocument, and pipeline tests
+
+  "transformers[torch, sentencepiece]>=4.57",         # SASEvaluator and TopPSampler
+  "sentence-transformers>=5.0.0",                     # SASEvaluator
+  "arrow>=1.3.0",                                     # Jinja2TimeExtension
+  "pillow",                                           # ImageContent
+  "pypdfium2",                                        # PDFToImageContent
+
 
   # Converters
-  "pypdf",  # PyPDFConverter
-  "pdfminer.six", # PDFMinerToDocument
-  "markdown-it-py",  # MarkdownToDocument
-  "mdit_plain",  # MarkdownToDocument
-  "tika",  # TikaDocumentConverter
-  "azure-ai-formrecognizer>=3.2.0b2",  # AzureOCRDocumentConverter
-  "langdetect",  # TextLanguageRouter and DocumentLanguageClassifier
-  "sentence-transformers>=2.2.0",  # SentenceTransformersTextEmbedder and SentenceTransformersDocumentEmbedder
-  "openai-whisper>=20231106",  # LocalWhisperTranscriber
-  "chroma-haystack",  # pipeline predefined templates
+  "pypdf",                            # PyPDFToDocument
+  "pdfminer.six",                     # PDFMinerToDocument
+  "markdown-it-py",                   # MarkdownToDocument
+  "mdit_plain",                       # MarkdownToDocument
+  "trafilatura",                      # HTMLToDocument
+  "python-pptx",                      # PPTXToDocument
+  "python-docx",                      # DocxToDocument
+  "jq",                               # JSONConverter
+  "openpyxl",                         # XLSXToDocument
+  "tabulate",                         # XLSXToDocument
+  "python-oxmsg",                     # MSGToDocument
 
-  # OpenAPI
-  "jsonref",  # OpenAPIServiceConnector, OpenAPIServiceToFunctions
-  "openapi3",
+  "nltk>=3.9.1", # NLTKDocumentSplitter, RecursiveDocumentSplitter
+  "tiktoken", # RecursiveDocumentSplitter, TiktokenCounter
 
-  # Validation
-  "jsonschema",
-
-  # Tracing
-  "opentelemetry-sdk",
-  "ddtrace",
+  # Human in the Loop
+  "rich",                 # Console rendering for HITL
 
   # Structured logging
   "structlog",
 
-  # Looking for missing imports
-  "isort",
-  "pyproject-parser",
+  # needed in link content fetcher tests
+  "httpx[http2]",
+
+  # Azure Utils
+  "azure-identity",
+
+  # Test
+  "pytest",
+  "pytest-bdd",
+  "pytest-cov",
+  "pytest-asyncio",
+  "pytest-rerunfailures",
+  "coverage",
+  "mypy",
+  "pip",                     # mypy needs pip to install missing stub packages
+  "ipython",
+  "colorama==0.4.6",         # Pipeline checkpoints test
 ]
 
 [tool.hatch.envs.test.scripts]
-e2e = "pytest e2e"
-unit = 'pytest --cov-report xml:coverage.xml --cov="haystack" -m "not integration" {args:test}'
+unit = 'pytest --cov="haystack" -m "not integration" {args:test}'
 integration = 'pytest --maxfail=5 -m "integration" {args:test}'
-integration-mac = 'pytest --maxfail=5 -m "integration" -k "not tika" {args:test}'
-integration-windows = 'pytest --maxfail=5 -m "integration" -k "not tika" {args:test}'
-types = "mypy --install-types --non-interactive --cache-dir=.mypy_cache/ {args:haystack}"
-lint = [
-  "ruff check {args:haystack}",
-  "pylint -ry -j 0 {args:haystack}"
-]
-lint-fix = [
-  "black .",
-  "ruff check {args:haystack} --fix",
-]
+integration-only-fast = 'pytest --maxfail=5 -m "integration and not slow" {args:test}'
+integration-only-slow = 'pytest --maxfail=5 -m "integration and slow" {args:test}'
+all = 'pytest {args:test}'
+e2e = 'pytest {args:e2e}'
 
-[tool.hatch.envs.readme]
-detached = true  # To avoid installing the dependencies from the default environment
-dependencies = [
-  "haystack-pydoc-tools",
-]
-
-[tool.hatch.envs.readme.scripts]
-sync = "./.github/utils/pydoc-markdown.sh"
-delete-outdated = "python ./.github/utils/delete_outdated_docs.py {args}"
-
-[tool.hatch.envs.snippets]
-extra-dependencies = [
-  "torch",
-  "pydantic",
-]
+# TODO We want to eventually type the whole test folder
+types = "mypy --install-types --non-interactive --cache-dir=.mypy_cache/ {args:haystack test/core/ test/marshal/ test/testing/ test/tracing/ test/tools/ test/hooks/human_in_the_loop test/evaluation test/document_stores test/dataclasses test/utils/ test/fuzz/ test/skill_stores/ test/components/caching/ test/components/embedders/ test/components/generators/ test/components/joiners/ test/components/query/ test/components/validators/ test/components/writers/}"
 
 [project.urls]
 "CI: GitHub" = "https://github.com/deepset-ai/haystack/actions"
@@ -184,85 +168,15 @@ pattern = "(?P<version>.+)"
 allow-direct-references = true
 
 [tool.hatch.build.targets.sdist]
-include = [
-  "/haystack",
-  "/VERSION.txt",
-]
+include = ["/haystack", "/VERSION.txt"]
 
 [tool.hatch.build.targets.wheel]
-packages = [
-  "haystack",
-]
-
-[tool.black]
-line-length = 120
-skip_magic_trailing_comma = true  # For compatibility with pydoc>=4.6, check if still needed.
+packages = ["haystack"]
 
 [tool.codespell]
-ignore-words-list = "ans,astroid,nd,ned,nin,ue,rouge,ist"
+ignore-words-list = "ans,astroid,nd,ned,nin,ue,rouge,ist, Claus,SME,Sie,unter"
 quiet-level = 3
-skip = "test/nodes/*,test/others/*,test/samples/*,e2e/*"
-
-[tool.pylint.'MESSAGES CONTROL']
-max-line-length=120
-disable = [
-
-  # To keep
-  "fixme",
-  "c-extension-no-member",
-
-  # To review:
-  "missing-docstring",
-  "unused-argument",
-  "no-member",
-  "line-too-long",
-  "protected-access",
-  "too-few-public-methods",
-  "raise-missing-from",
-  "invalid-name",
-  "duplicate-code",
-  "arguments-differ",
-  "consider-using-f-string",
-  "no-else-return",
-  "attribute-defined-outside-init",
-  "super-with-arguments",
-  "redefined-builtin",
-  "abstract-method",
-  "unspecified-encoding",
-  "unidiomatic-typecheck",
-  "no-name-in-module",
-  "consider-using-with",
-  "redefined-outer-name",
-  "arguments-renamed",
-  "unnecessary-pass",
-  "broad-except",
-  "unnecessary-comprehension",
-  "subprocess-run-check",
-  "singleton-comparison",
-  "consider-iterating-dictionary",
-  "undefined-loop-variable",
-  "consider-using-in",
-  "bare-except",
-  "unexpected-keyword-arg",
-  "simplifiable-if-expression",
-  "use-list-literal",
-  "broad-exception-raised",
-
-  # To review later
-  "cyclic-import",
-  "import-outside-toplevel",
-  "deprecated-method",
-]
-[tool.pylint.'DESIGN']
-max-args = 38  # Default is 5
-max-attributes = 28  # Default is 7
-max-branches = 34  # Default is 12
-max-locals = 45  # Default is 15
-max-module-lines = 2468  # Default is 1000
-max-nested-blocks = 9  # Default is 5
-max-statements = 206  # Default is 50
-[tool.pylint.'SIMILARITIES']
-min-similarity-lines=6
+skip = "./test,./e2e,*.svg,*/abbreviations/*"
 
 [tool.pytest.ini_options]
 minversion = "6.0"
@@ -271,97 +185,169 @@ markers = [
   "unit: unit tests",
   "integration: integration tests",
 
-  "generator: generator tests",
-  "summarizer: summarizer tests",
-  "embedding_dim: uses a document store with non-default embedding dimension (e.g @pytest.mark.embedding_dim(128))",
-
-  "tika: requires Tika container",
-  "parsr: requires Parsr container",
-  "ocr: requires Tesseract",
-
-  "elasticsearch: requires Elasticsearch container",
-  "weaviate: requires Weaviate container",
-  "pinecone: requires Pinecone credentials",
-  "faiss: uses FAISS",
-  "opensearch",
-  "document_store",
+  # integration tests that are slow (e.g. model inference on CPU), unstable (e.g. call unstable external services)
+  # or require special setup (e.g. installing system dependencies, running Docker containers)
+  "slow: slow/unstable integration tests",
 ]
 log_cli = true
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "class"
 
 [tool.mypy]
-warn_return_any = false
-warn_unused_configs = true
+python_version = "3.10"
+check_untyped_defs = true
+disallow_incomplete_defs = true
 ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = false
+
+
+[[tool.mypy.overrides]]
+# TODO: Fix testing typings
+module = ["haystack.testing.*"]
+disallow_incomplete_defs = false
 
 [tool.ruff]
-line-length = 301
-target-version = "py38"
-exclude= ["test"]
+exclude = ["*.md", "e2e/**", "proposals"]
+line-length = 120
 
 
-[tool.ruff.lint]
-select = [
-  "ASYNC",  # flake8-async
-  "C4",     # flake8-comprehensions
-  "C90",    # McCabe cyclomatic complexity
-  "E501",   # Long lines
-  "EXE",    # flake8-executable
-  "F",      # Pyflakes
-  "INT",    # flake8-gettext
-  "PERF",   # Perflint
-  "PL",     # Pylint
-  "Q",      # flake8-quotes
-  "SIM",    # flake8-simplify
-  "SLOT",   # flake8-slots
-  "T10",    # flake8-debugger
-  "W",      # pycodestyle
-  "YTT",    # flake8-2020
-  "I",       # isort
-  # built-in shadowing
-  "A001",	# builtin-variable-shadowing
-  "A002",	# builtin-argument-shadowing
-  "A003",	# builtin-attribute-shadowing
-  # docstring rules
-  "D102",   # Missing docstring in public method
-  "D103",   # Missing docstring in public function
-  "D209",   # Closing triple quotes go to new line
-  "D205",   # 1 blank line required between summary line and description
-  "D213",   # summary lines must be positioned on the second physical line of the docstring
-  "D417",   # undocumented-parameter
-  "D419",   # undocumented-returns
-]
+[tool.ruff.format]
+skip-magic-trailing-comma = true
 
-ignore = [
-  "F401",     # unused-import
-  "PERF203",	# `try`-`except` within a loop incurs performance overhead
-  "PERF401",	# Use a list comprehension to create a transformed list
-  "PLR1714",  # repeated-equality-comparison
-  "PLR5501",  # collapsible-else-if
-  "PLW0603",  # global-statement
-  "PLW1510",  # subprocess-run-without-check
-  "PLW2901",  # redefined-loop-name
-  "SIM108",   # if-else-block-instead-of-if-exp
-  "SIM115",   # open-file-with-context-handler
-  "SIM118",   # in-dict-keys
-]
+[tool.ruff.lint.isort]
+split-on-trailing-comma = false
 
 [tool.ruff.lint.mccabe]
-max-complexity = 28
-
-[tool.ruff.lint.per-file-ignores]
-"examples/basic_qa_pipeline.py" = ["C416"]
-"haystack/preview/testing/document_store.py" = ["C416", "F821"]
-"haystack/telemetry.py" = ["F821"]
+max-complexity = 20   # Default is 10 for Ruff
 
 [tool.ruff.lint.pylint]
 allow-magic-value-types = ["float", "int", "str"]
-max-args = 14  # Default is 5
-max-branches = 21  # Default is 12
-max-public-methods = 20  # Default is 20
-max-returns = 7  # Default is 6
-max-statements = 60  # Default is 50
+max-args = 13                                     # Default is 5
+max-branches = 21                                 # Default is 12
+max-public-methods = 20                           # Default is 20
+max-returns = 7                                   # Default is 6
+max-statements = 56                               # Default is 50
+
+[tool.ruff.lint]
+select = [
+  "A001",   # builtin-variable-shadowing
+  "A002",   # builtin-argument-shadowing
+  "A003",   # builtin-attribute-shadowing
+  "ANN",    # flake8-annotations
+  "ARG",    # flake8-unused-arguments
+  "ASYNC",  # flake8-async
+  "B",      # flake8-bugbear
+  "BLE",    # flake8-blind-except
+  "C4",     # flake8-comprehensions
+  "C90",    # mccabe complexity
+  "COM818", # trailing-comma-on-bare-tuple
+  "D102",   # Missing docstring in public method
+  "D103",   # Missing docstring in public function
+  "D205",   # 1 blank line required between summary line and description
+  "D209",   # Closing triple quotes go to new line
+  "D213",   # summary lines must be positioned on the second physical line of the docstring
+  "D417",   # undocumented-parameter
+  "D419",   # undocumented-returns
+  "E",      # pycodestyle errors
+  "EXE",    # flake8-executable
+  "F",      # pyflakes
+  "G001",   # logging-format-interpolation
+  "G002",   # logging-percent-format
+  "G004",   # logging-f-string
+  "I",      # isort
+  "ISC001", # implicit-string-concatenation
+  "INT",    # flake8-gettext
+  "PERF",   # perflint
+  "PIE",    # flake8-pie
+  "PL",     # pylint
+  "RET",    # flake8-return
+  "RUF104", # unmatched-suppression-comment
+  "S102",   # flake8-bandit (exec-builtin)
+  "S307",   # flake8-bandit (eval)
+  "SIM",    # flake8-simplify
+  "SLOT",   # flake8-slots
+  "T10",    # flake8-debugger
+  "TID252", # relative-imports
+  "TRY",    # tryceratops
+  "UP",     # pyupgrade
+  "W",      # pycodestyle warnings
+  "YTT",    # flake8-2020
+]
+
+ignore = [
+  "ANN401",  # Allow `Any` - used legitimately for dynamic types and SDK boundaries
+  "B008",    # function-call-as-argument-default
+  "B904",    # raise-without-from-inside-except
+  "BLE001",  # blind-except
+  "E721",    # type-comparison
+  "E722",    # bare-except
+  "PERF203", # try-except-in-loop
+  "PERF401", # manual-list-comprehension
+  "PIE790",  # unnecessary-pass
+
+  # we re-export symbols in __init__ for correct type checking
+  # https://typing.python.org/en/latest/spec/distributing.html#import-conventions
+  "PLC0414", # useless-import-alias
+
+  "PLC0415", # import-outside-top-level
+  "PLR1714", # repeated-equality-comparison
+  "PLW0603", # global-statement
+  "PLW1514", # unspecified-encoding
+  "PLW2901", # redefined-loop-name
+  "RET505",  # superfluous-else-return
+  "SIM108",  # if-else-block-instead-of-ternary
+  "SIM109",  # multiple-comparisons-with-in
+  "SIM118",  # in-dict-keys
+  "TRY002",  # raise-vanilla-class
+  "TRY003",  # raise-vanilla-args
+  "TRY201",  # verbose-raise
+  "TRY300",  # try-consider-else
+  "UP008",   # super-with-arguments
+  "UP032",   # use-f-string
+  "UP037",   # quoted-annotation
+]
+
+[tool.ruff.lint.per-file-ignores]
+"test/**" = [
+  "ANN",     # flake8-annotations
+  "ARG",     # flake8-unused-arguments
+  "B018",    # useless-expression
+  "D",       # pydocstyle (docstring checks)
+  "E711",    # none-comparison
+  "E731",    # lambda-assignment
+  "PLC0206", # dict-index-missing-items
+  "SIM105",  # suppressible-exception
+  "SIM117",  # multiple-with-statements
+]
+# in the following files, we still allow old type hints to handle and test them
+# UP006: generics like typing.List, typing.Dict
+# UP007: Union[X, Y] syntax
+# UP035: Deprecated import
+# UP045: Optional[X] syntax
+"haystack/testing/**" = ["ANN"]
+"haystack/components/agents/state/state_utils.py" = ["UP007"]
+"haystack/core/super_component/utils.py" = ["UP007"]
+"haystack/core/type_utils.py" = ["UP007"]
+"haystack/tools/parameters_schema_utils.py" = ["UP007"]
+"test/components/agents/test_state_class.py" = ["UP006", "UP007", "UP035", "UP045"]
+"test/components/converters/test_output_adapter.py" = ["UP006", "UP035"]
+"test/components/joiners/test_list_joiner.py" = ["UP006", "UP035"]
+"test/core/pipeline/test_type_syntax_compatibility.py" = ["UP007", "UP045"]
+"test/core/super_component/test_utils.py" = ["UP007", "UP045"]
+"test/core/test_type_utils.py" = ["UP006", "UP007", "UP035", "UP045"]
+"test/tools/test_parameters_schema_utils.py" = ["UP007"]
+"test/utils/test_type_serialization.py" = ["UP006", "UP007", "UP035", "UP045"]
+
+[tool.uv]
+# Exclude package versions published within the last 24 hours to protect against supply chain
+# attacks via compromised dependencies. uv resolves this relative to the current clock at
+# install/lock time, so no manual date updates are needed.
+# First-party packages are exempted so freshly published releases are always resolvable.
+exclude-newer = "24 hours"
+exclude-newer-package = { haystack-pydoc-tools = "0 days" }
 
 [tool.coverage.run]
-omit = [
-    "haystack/testing/*",
-]
+omit = ["haystack/testing/*"]
+relative_files = true

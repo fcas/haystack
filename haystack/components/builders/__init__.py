@@ -2,9 +2,21 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from haystack.components.builders.answer_builder import AnswerBuilder
-from haystack.components.builders.dynamic_chat_prompt_builder import DynamicChatPromptBuilder
-from haystack.components.builders.dynamic_prompt_builder import DynamicPromptBuilder
-from haystack.components.builders.prompt_builder import PromptBuilder
+import sys
+from typing import TYPE_CHECKING
 
-__all__ = ["AnswerBuilder", "PromptBuilder", "DynamicPromptBuilder", "DynamicChatPromptBuilder"]
+from lazy_imports import LazyImporter
+
+_import_structure = {
+    "answer_builder": ["AnswerBuilder"],
+    "chat_prompt_builder": ["ChatPromptBuilder"],
+    "prompt_builder": ["PromptBuilder"],
+}
+
+if TYPE_CHECKING:
+    from .answer_builder import AnswerBuilder as AnswerBuilder
+    from .chat_prompt_builder import ChatPromptBuilder as ChatPromptBuilder
+    from .prompt_builder import PromptBuilder as PromptBuilder
+
+else:
+    sys.modules[__name__] = LazyImporter(name=__name__, module_file=__file__, import_structure=_import_structure)

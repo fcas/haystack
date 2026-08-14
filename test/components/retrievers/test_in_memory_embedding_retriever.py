@@ -1,36 +1,37 @@
 # SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
 #
 # SPDX-License-Identifier: Apache-2.0
-from typing import Dict, Any
+
+from typing import Any
 
 import pytest
-import numpy as np
 
-from haystack import Pipeline, DeserializationError
-from haystack.testing.factory import document_store_class
+from haystack import Pipeline
 from haystack.components.retrievers.in_memory.embedding_retriever import InMemoryEmbeddingRetriever
 from haystack.dataclasses import Document
 from haystack.document_stores.in_memory import InMemoryDocumentStore
+from haystack.document_stores.types import FilterPolicy
+from haystack.testing.factory import document_store_class
 
 
 class TestMemoryEmbeddingRetriever:
-    def test_init_default(self):
-        retriever = InMemoryEmbeddingRetriever(InMemoryDocumentStore())
+    def test_init_default(self, in_memory_doc_store):
+        retriever = InMemoryEmbeddingRetriever(in_memory_doc_store)
         assert retriever.filters is None
         assert retriever.top_k == 10
         assert retriever.scale_score is False
 
-    def test_init_with_parameters(self):
+    def test_init_with_parameters(self, in_memory_doc_store):
         retriever = InMemoryEmbeddingRetriever(
-            InMemoryDocumentStore(), filters={"name": "test.txt"}, top_k=5, scale_score=True
+            in_memory_doc_store, filters={"name": "test.txt"}, top_k=5, scale_score=True
         )
         assert retriever.filters == {"name": "test.txt"}
         assert retriever.top_k == 5
         assert retriever.scale_score
 
-    def test_init_with_invalid_top_k_parameter(self):
+    def test_init_with_invalid_top_k_parameter(self, in_memory_doc_store):
         with pytest.raises(ValueError):
-            InMemoryEmbeddingRetriever(InMemoryDocumentStore(), top_k=-2)
+            InMemoryEmbeddingRetriever(in_memory_doc_store, top_k=-2)
 
     def test_to_dict(self):
         MyFakeStore = document_store_class("MyFakeStore", bases=(InMemoryDocumentStore,))
@@ -47,6 +48,7 @@ class TestMemoryEmbeddingRetriever:
                 "top_k": 10,
                 "scale_score": False,
                 "return_embedding": False,
+                "filter_policy": "replace",
             },
         }
 
@@ -70,6 +72,7 @@ class TestMemoryEmbeddingRetriever:
                 "top_k": 5,
                 "scale_score": True,
                 "return_embedding": True,
+                "filter_policy": "replace",
             },
         }
 
@@ -83,6 +86,7 @@ class TestMemoryEmbeddingRetriever:
                 },
                 "filters": {"name": "test.txt"},
                 "top_k": 5,
+                "filter_policy": "merge",
             },
         }
         component = InMemoryEmbeddingRetriever.from_dict(data)
@@ -90,13 +94,14 @@ class TestMemoryEmbeddingRetriever:
         assert component.filters == {"name": "test.txt"}
         assert component.top_k == 5
         assert component.scale_score is False
+        assert component.filter_policy == FilterPolicy.MERGE
 
     def test_from_dict_without_docstore(self):
         data = {
             "type": "haystack.components.retrievers.in_memory.embedding_retriever.InMemoryEmbeddingRetriever",
             "init_parameters": {},
         }
-        with pytest.raises(DeserializationError, match="Missing 'document_store' in serialization data"):
+        with pytest.raises(TypeError, match="missing 1 required positional argument: 'document_store'"):
             InMemoryEmbeddingRetriever.from_dict(data)
 
     def test_from_dict_without_docstore_type(self):
@@ -104,15 +109,19 @@ class TestMemoryEmbeddingRetriever:
             "type": "haystack.components.retrievers.in_memory.embedding_retriever.InMemoryEmbeddingRetriever",
             "init_parameters": {"document_store": {"init_parameters": {}}},
         }
-        with pytest.raises(DeserializationError):
+        with pytest.raises(TypeError, match="document_store must be an instance of InMemoryDocumentStore"):
             InMemoryEmbeddingRetriever.from_dict(data)
 
     def test_from_dict_nonexisting_docstore(self):
+        # Use a type whose module passes the deserialization allowlist (haystack.*) but cannot be
+        # resolved, so we still exercise the "import failed" code path rather than the allowlist gate.
         data = {
             "type": "haystack.components.retrievers.in_memory.embedding_retriever.InMemoryEmbeddingRetriever",
-            "init_parameters": {"document_store": {"type": "Nonexisting.Docstore", "init_parameters": {}}},
+            "init_parameters": {"document_store": {"type": "haystack.does.not.exist.Docstore", "init_parameters": {}}},
         }
-        with pytest.raises(DeserializationError):
+        with pytest.raises(
+            ImportError, match=r"Failed to deserialize 'document_store':.*haystack\.does\.not\.exist\.Docstore"
+        ):
             InMemoryEmbeddingRetriever.from_dict(data)
 
     def test_valid_run(self):
@@ -130,11 +139,72 @@ class TestMemoryEmbeddingRetriever:
 
         assert "documents" in result
         assert len(result["documents"]) == top_k
-        assert np.array_equal(result["documents"][0].embedding, [1.0, 1.0, 1.0, 1.0])
+        assert result["documents"][0].embedding == [1.0, 1.0, 1.0, 1.0]
+
+    def test_run_with_filter_policy_merge_combines_init_and_runtime_filters(self):
+        ds = InMemoryDocumentStore(embedding_similarity_function="cosine")
+        ds.write_documents(
+            [
+                Document(
+                    content="python article current",
+                    embedding=[1.0, 0.0, 0.0, 0.0],
+                    meta={"type": "article", "year": 2020},
+                ),
+                Document(
+                    content="python blog current", embedding=[1.0, 0.0, 0.0, 0.0], meta={"type": "blog", "year": 2021}
+                ),
+                Document(
+                    content="python article archived",
+                    embedding=[1.0, 0.0, 0.0, 0.0],
+                    meta={"type": "article", "year": 2019},
+                ),
+            ]
+        )
+
+        retriever = InMemoryEmbeddingRetriever(
+            ds, filters={"field": "meta.type", "operator": "==", "value": "article"}, filter_policy=FilterPolicy.MERGE
+        )
+
+        result = retriever.run(
+            query_embedding=[1.0, 0.0, 0.0, 0.0], filters={"field": "meta.year", "operator": ">=", "value": 2020}
+        )
+
+        assert [doc.content for doc in result["documents"]] == ["python article current"]
+
+    @pytest.mark.asyncio
+    async def test_run_async_with_filter_policy_merge_combines_init_and_runtime_filters(self):
+        ds = InMemoryDocumentStore(embedding_similarity_function="cosine")
+        ds.write_documents(
+            [
+                Document(
+                    content="python article current",
+                    embedding=[1.0, 0.0, 0.0, 0.0],
+                    meta={"type": "article", "year": 2020},
+                ),
+                Document(
+                    content="python blog current", embedding=[1.0, 0.0, 0.0, 0.0], meta={"type": "blog", "year": 2021}
+                ),
+                Document(
+                    content="python article archived",
+                    embedding=[1.0, 0.0, 0.0, 0.0],
+                    meta={"type": "article", "year": 2019},
+                ),
+            ]
+        )
+
+        retriever = InMemoryEmbeddingRetriever(
+            ds, filters={"field": "meta.type", "operator": "==", "value": "article"}, filter_policy=FilterPolicy.MERGE
+        )
+
+        result = await retriever.run_async(
+            query_embedding=[1.0, 0.0, 0.0, 0.0], filters={"field": "meta.year", "operator": ">=", "value": 2020}
+        )
+
+        assert [doc.content for doc in result["documents"]] == ["python article current"]
 
     def test_invalid_run_wrong_store_type(self):
         SomeOtherDocumentStore = document_store_class("SomeOtherDocumentStore")
-        with pytest.raises(ValueError, match="document_store must be an instance of InMemoryDocumentStore"):
+        with pytest.raises(TypeError, match="document_store must be an instance of InMemoryDocumentStore"):
             InMemoryEmbeddingRetriever(SomeOtherDocumentStore())
 
     @pytest.mark.integration
@@ -151,7 +221,7 @@ class TestMemoryEmbeddingRetriever:
 
         pipeline = Pipeline()
         pipeline.add_component("retriever", retriever)
-        result: Dict[str, Any] = pipeline.run(
+        result: dict[str, Any] = pipeline.run(
             data={"retriever": {"query_embedding": [0.1, 0.1, 0.1, 0.1], "return_embedding": True}}
         )
 
@@ -160,4 +230,4 @@ class TestMemoryEmbeddingRetriever:
         results_docs = result["retriever"]["documents"]
         assert results_docs
         assert len(results_docs) == top_k
-        assert np.array_equal(results_docs[0].embedding, [1.0, 1.0, 1.0, 1.0])
+        assert results_docs[0].embedding == [1.0, 1.0, 1.0, 1.0]

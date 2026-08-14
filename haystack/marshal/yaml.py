@@ -2,16 +2,44 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Dict, Union
+from typing import Any
 
 import yaml
 
 
-class YamlMarshaller:
-    def marshal(self, dict_: Dict[str, Any]) -> str:
-        """Return a YAML representation of the given dictionary."""
-        return yaml.dump(dict_)
+# Custom YAML safe loader that supports loading Python tuples
+class YamlLoader(yaml.SafeLoader):
+    def construct_python_tuple(self, node: yaml.SequenceNode) -> tuple:
+        """Construct a Python tuple from the sequence."""
+        return tuple(self.construct_sequence(node))
 
-    def unmarshal(self, data_: Union[str, bytes, bytearray]) -> Dict[str, Any]:
+
+class YamlDumper(yaml.SafeDumper):
+    def represent_tuple(self, data: tuple) -> yaml.SequenceNode:
+        """Represent a Python tuple."""
+        return self.represent_sequence("tag:yaml.org,2002:python/tuple", data)
+
+
+YamlDumper.add_representer(tuple, YamlDumper.represent_tuple)
+YamlLoader.add_constructor("tag:yaml.org,2002:python/tuple", YamlLoader.construct_python_tuple)
+
+
+class YamlMarshaller:
+    def marshal(self, dict_: dict[str, Any]) -> str:
+        """Return a YAML representation of the given dictionary."""
+        try:
+            return yaml.dump(dict_, Dumper=YamlDumper)
+        except yaml.representer.RepresenterError as e:
+            raise TypeError(
+                "Error dumping pipeline to YAML - Ensure that all pipeline components only serialize basic Python types"
+            ) from e
+
+    def unmarshal(self, data_: str | bytes | bytearray) -> dict[str, Any]:
         """Return a dictionary from the given YAML data."""
-        return yaml.safe_load(data_)
+        try:
+            return yaml.load(data_, Loader=YamlLoader)
+        except yaml.constructor.ConstructorError as e:
+            raise TypeError(
+                "Error loading pipeline from YAML - Ensure that all pipeline "
+                "components only serialize basic Python types"
+            ) from e
